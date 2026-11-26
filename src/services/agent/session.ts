@@ -8,7 +8,7 @@ import { stream as streamOpenAICompletions } from '@earendil-works/pi-ai/api/ope
 import { z } from 'zod'
 import { addAgentFeatureToPayload, createPiModel, resolvePiApiKey } from './model'
 import { mapBoxPlayerCloudAIError } from '../../utils/boxplayerCloudAI'
-import type { AgentApprovalRequest, AgentEvent as BoxPlayerAgentEvent, AgentMessageInput, AgentPermission, AgentSessionConfig, AgentTool as BoxPlayerAgentTool, BoxPlayerAgentModelConfig, Citation } from './types'
+import type { AgentApprovalPermission, AgentApprovalRequest, AgentEvent as BoxPlayerAgentEvent, AgentMessageInput, AgentPermission, AgentSessionConfig, AgentTool as BoxPlayerAgentTool, BoxPlayerAgentModelConfig, Citation } from './types'
 
 export interface RunBoxPlayerAgentOptions extends AgentSessionConfig {
   messages?: AgentMessageInput[]
@@ -51,10 +51,15 @@ export function isLeakedAgentContext(text: string): boolean {
   return AGENT_PROMPT_LEAK_PATTERNS.some(pattern => pattern.test(text))
 }
 
+/** Fallback for tools without a declared permission. An unrecognized name is never treated as a safe read. */
 export function inferToolPermission(name: string): AgentPermission {
   if (DESTRUCTIVE_TOOL_NAMES.has(name)) return 'destructive'
   if (WRITE_TOOL_NAMES.has(name)) return 'write'
-  return 'read'
+  return 'unknown'
+}
+
+function requiresApproval(permission: AgentPermission): permission is AgentApprovalPermission {
+  return permission === 'write' || permission === 'destructive' || permission === 'unknown'
 }
 
 export function formatAgentModelError(model: BoxPlayerAgentModelConfig, error: unknown): string {
@@ -196,8 +201,8 @@ export async function runBoxPlayerAgent(options: RunBoxPlayerAgentOptions): Prom
       if (toolCallCount > (options.maxToolCalls || 5)) return { block: true, reason: 'Tool call limit reached.' }
       toolCallsThisTurn++
       if (options.maxToolCallsPerTurn && toolCallsThisTurn > options.maxToolCallsPerTurn) return { block: true, reason: 'Only one tool call is allowed per Agent turn. Observe its result before choosing the next action.' }
-      const permission = permissions.get(toolCall.name) || 'read'
-      if (permission === 'write' || permission === 'destructive') {
+      const permission = permissions.get(toolCall.name) || inferToolPermission(toolCall.name)
+      if (requiresApproval(permission)) {
         const request = await createApprovalRequest(toolCall.id, toolCall.name, permission, args)
         await options.onEvent?.({ type: 'approval_required', request })
         const approved = await options.requestApproval?.(request)
@@ -249,17 +254,26 @@ export async function runBoxPlayerAgent(options: RunBoxPlayerAgentOptions): Prom
   const abort = () => agent.abort()
   options.signal?.addEventListener('abort', abort, { once: true })
 
+  let failure: Error | undefined
   try {
     await agent.prompt(promptWithUntrustedContext(options.prompt, options.untrustedContext))
     // A sandbox may deliberately stop after a terminal tool result. Pi reports
     // that as an abort; surfacing it as a model error makes a successful import
     // look failed and can poison the task's subsequent event interpretation.
-    if (!expectedStop && agent.state.errorMessage) await options.onEvent?.({ type: 'error', message: formatAgentModelError(options.model, agent.state.errorMessage) })
+    if (!expectedStop && agent.state.errorMessage) failure = new Error(formatAgentModelError(options.model, agent.state.errorMessage))
   } catch (error) {
-    if (!expectedStop) await options.onEvent?.({ type: 'error', message: formatAgentModelError(options.model, error) })
+    if (!expectedStop) failure = new Error(formatAgentModelError(options.model, error))
   } finally {
     options.signal?.removeEventListener('abort', abort)
     unsubscribe()
+  }
+  // Callers use the rejected promise to end their visible loading state. The
+  // previous implementation only emitted an event, so an async subscriber
+  // could not propagate the failure and document Q&A misleadingly showed an
+  // empty generic reply instead of the real model/login/quota error.
+  if (failure) {
+    await options.onEvent?.({ type: 'error', message: failure.message })
+    throw failure
   }
   return agent.state.messages as unknown[]
 }
@@ -308,7 +322,13 @@ function pruneContext(messages: AgentMessage[], maxChars: number): AgentMessage[
   return kept
 }
 
-async function createApprovalRequest(toolCallId: string, toolName: string, permission: Extract<AgentPermission, 'write' | 'destructive'>, args: unknown): Promise<AgentApprovalRequest> {
+const APPROVAL_RISKS: Record<AgentApprovalPermission, string> = {
+  write: '此操作会修改用户网盘中的数据。',
+  destructive: '此操作会删除或不可逆地修改用户数据。',
+  unknown: '此工具未声明权限，无法确认它是否会修改数据。'
+}
+
+async function createApprovalRequest(toolCallId: string, toolName: string, permission: AgentApprovalPermission, args: unknown): Promise<AgentApprovalRequest> {
   const canonicalArgs = stableJson(args)
   const approvalHash = await sha256(`${toolName}:${canonicalArgs}`)
   return {
@@ -317,7 +337,7 @@ async function createApprovalRequest(toolCallId: string, toolName: string, permi
     permission,
     args,
     argsSummary: canonicalArgs.slice(0, 500),
-    risk: permission === 'destructive' ? '此操作会删除或不可逆地修改用户数据。' : '此操作会修改用户网盘中的数据。',
+    risk: APPROVAL_RISKS[permission],
     approvalHash
   }
 }

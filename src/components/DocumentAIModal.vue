@@ -53,6 +53,8 @@ const extraSources = ref<DocumentInsightSourceInput[]>([])
 const removedSourceIds = ref(new Set<string>())
 const abortController = ref<AbortController | null>(null)
 const expanded = ref(false)
+const sidebarWidth = ref(420)
+const resizing = ref(false)
 const feedback = ref('')
 const sourcesOpen = ref(false)
 const pickerOpen = ref(false)
@@ -94,15 +96,16 @@ const isMultiSource = computed(() => allSourceInputs.value.length > 1)
 // the workspace. Keeping the sidebar layout here leaves the composer pinned
 // to the old 340px column after the overlay expands.
 const layout = computed(() => props.mode === 'workspace' || isMultiSource.value || expanded.value ? 'workspace' : 'sidebar')
+const documentAiStyle = computed(() => layout.value === 'sidebar' ? { width: `${sidebarWidth.value}px` } : undefined)
 const sourceHeading = computed(() => {
   const count = allSourceInputs.value.length
-  if (count === 1) return `Ask questions about “${allSourceInputs.value[0]?.file?.name || allSourceInputs.value[0]?.file?.file_name || '文档'}”`
-  return `Ask questions about ${count} files${props.scopeName ? ` in ‘${props.scopeName}’` : ''}`
+  if (count === 1) return `${allSourceInputs.value[0]?.file?.name || allSourceInputs.value[0]?.file?.file_name || '文档'}`
+  return `${count} 份文档${props.scopeName ? ` · ${props.scopeName}` : ''}`
 })
 const privacyText = computed(() => canUseSemanticEmbeddings(createBookAISettings().provider)
-  ? '已选网盘文件在本机按页解析；仅相关片段会用于检索和回答。'
-  : '已选网盘文件在本机解析并建立关键词索引；回答只使用相关片段。')
-const quickPrompts = ['总结这些来源', '有哪些关键要点？', '这份文档可如何改进？', '这些文档定义了哪些下一步？']
+  ? '结合原文回答，支持页码引用。'
+  : '基于文档内容回答，可跳转原文。')
+const quickPrompts = ['总结文档', '提炼关键要点', '有哪些改进建议？', '整理待办事项']
 const candidates = computed(() => {
   const selected = new Set(allSourceInputs.value.map(documentInsightSourceId))
   return props.availableSources.filter(source => isDocumentInsightFile(source.file) && !selected.has(documentInsightSourceId(source))).slice(0, 30)
@@ -134,6 +137,41 @@ const singlePdfSource = computed(() => readySources.value.length === 1 && /\.pdf
 const readingCompleted = computed(() => readingJob.value?.units.filter(unit => unit.status === 'completed' || unit.status === 'skipped').length || 0)
 const completedReadingUnits = computed(() => readingJob.value?.units.filter(unit => unit.status === 'completed' && unit.summary) || [])
 const hasReadingNotes = computed(() => completedReadingUnits.value.length > 0)
+
+try {
+  const savedWidth = Number(localStorage.getItem('boxplayer.documentAi.sidebarWidth'))
+  if (Number.isFinite(savedWidth) && savedWidth >= 300 && savedWidth <= 760) sidebarWidth.value = savedWidth
+} catch {}
+
+let resizeStartX = 0
+let resizeStartWidth = 0
+function stopSidebarResize() {
+  if (!resizing.value) return
+  resizing.value = false
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  window.removeEventListener('pointermove', resizeSidebar)
+  window.removeEventListener('pointerup', stopSidebarResize)
+  window.removeEventListener('pointercancel', stopSidebarResize)
+  try { localStorage.setItem('boxplayer.documentAi.sidebarWidth', String(sidebarWidth.value)) } catch {}
+}
+function resizeSidebar(event: PointerEvent) {
+  if (!resizing.value) return
+  const maxWidth = Math.max(300, Math.min(760, window.innerWidth - 320))
+  sidebarWidth.value = Math.min(maxWidth, Math.max(300, resizeStartWidth + resizeStartX - event.clientX))
+}
+function startSidebarResize(event: PointerEvent) {
+  if (layout.value !== 'sidebar' || expanded.value || event.button !== 0) return
+  event.preventDefault()
+  resizeStartX = event.clientX
+  resizeStartWidth = sidebarWidth.value
+  resizing.value = true
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('pointermove', resizeSidebar)
+  window.addEventListener('pointerup', stopSidebarResize)
+  window.addEventListener('pointercancel', stopSidebarResize)
+}
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.includes('document_has_no_text')) return '此 PDF 不包含可检索文字，暂不支持图片型 PDF'
@@ -173,6 +211,9 @@ function requireDocumentAIPro(): boolean {
 function isPdfSource(source: { fileName: string }): boolean { return /\.pdf$/i.test(source.fileName) }
 
 async function indexCloudSource(source: SourceState, settings: ReturnType<typeof createBookAISettings>, provider: ReturnType<typeof getAIProvider>) {
+  // Preview windows start with an empty account cache. Load the file owner's
+  // persisted account before resolving its provider and download headers.
+  await UserDAL.GetUserTokenFromDB(source.userId)
   const download = await DriveFile.ApiFileDownloadUrl(source.userId, source.file.drive_id || '', source.file.file_id, 14_400)
   if (typeof download === 'string') throw new Error(download)
   const embeddingModel = canUseSemanticEmbeddings(settings.provider) ? provider.getEmbeddingModel() : undefined
@@ -414,8 +455,9 @@ async function ask(promptOverride?: string) {
       if (!assistantMessage.text) assistantMessage.text = answerTimedOut.value ? '回答超过 90 秒仍未完成，已停止本次请求。' : '已停止本次回答。'
     } else {
       console.error('文档问答失败:', error)
-      status.value = '文档问答失败，请重试。'
-      if (!assistantMessage.text) assistantMessage.text = '暂时无法生成回答，请重试。'
+      const message = errorMessage(error)
+      status.value = `文档问答失败：${message}`
+      if (!assistantMessage.text) assistantMessage.text = `暂时无法生成回答：${message}`
     }
   } finally {
     window.clearTimeout(timeout)
@@ -596,13 +638,15 @@ watch(() => `${browserUserId.value}:${browserDriveId.value}`, () => {
 })
 if (props.visible) startSession()
 onBeforeUnmount(() => {
+  stopSidebarResize()
   abortController.value?.abort()
   clearTemporaryIndexes()
 })
 </script>
 
 <template>
-  <aside v-show='visible' :class="['document-ai', `document-ai--${layout}`, { 'document-ai--expanded': expanded }]">
+  <aside v-show='visible' :class="['document-ai', `document-ai--${layout}`, { 'document-ai--expanded': expanded, 'document-ai--resizing': resizing }]" :style='documentAiStyle'>
+    <div v-if="layout === 'sidebar' && !expanded" class='document-ai__resize-handle' data-testid='document-ai-resize-handle' role='separator' aria-orientation='vertical' aria-label='调整 AI 对话框宽度' @pointerdown='startSidebarResize'></div>
     <header class='document-ai__header'>
       <div class='document-ai__brand'><span class='document-ai__brand-icon'><Sparkles :size='18' /></span><span v-if="layout === 'workspace'" class='document-ai__agent'>AGENT</span><span>BoxPlayer AI</span><ChevronDown :size='14' /></div>
       <div class='document-ai__header-actions'>
@@ -613,7 +657,7 @@ onBeforeUnmount(() => {
     </header>
 
     <section class='document-ai__body'>
-      <div class='document-ai__context'>
+      <div class='document-ai__context' data-testid='document-ai-context'>
         <FileText :size='18' />
         <div>
           <strong>{{ sourceHeading }}</strong>
@@ -645,8 +689,8 @@ onBeforeUnmount(() => {
 
       <div v-if='!messages.length' class='document-ai__empty'>
         <span class='document-ai__hero-icon'><Sparkles :size='26' /></span>
-        <h2>{{ layout === 'workspace' ? 'Ask BoxPlayer AI' : 'What can I help you with?' }}</h2>
-        <p>{{ status || (indexing ? '正在准备来源…' : '从下方建议开始，或提出一个具体问题。') }}</p>
+        <h2>{{ layout === 'workspace' ? '与文档对话' : '想了解文档的哪些内容？' }}</h2>
+        <p>{{ status || (indexing ? '正在准备来源…' : '选择下方问题，或输入你想了解的内容。') }}</p>
         <div class='document-ai__suggestions'>
           <button v-for='prompt in quickPrompts' :key='prompt' type='button' :disabled='asking' @click='askQuickPrompt(prompt)'>{{ prompt }}</button>
         </div>
@@ -661,6 +705,7 @@ onBeforeUnmount(() => {
 
       <div v-else class='document-ai__conversation'>
         <article v-for='item in messages' :key='item.id' :class="['document-ai__message', `document-ai__message--${item.role}`]">
+          <div v-if="item.role === 'assistant'" class='document-ai__message-meta'><Sparkles :size='13' /><span>BoxPlayer AI</span><span class='document-ai__message-rule'>基于文档</span></div>
           <div v-if="item.role === 'assistant' && item.text" class='document-ai__message-text document-ai__message-markdown' v-html='renderDocumentMarkdown(item.text)' />
           <div v-else class='document-ai__message-text'>{{ item.text || (asking && item.role === 'assistant' ? '正在生成回答…' : '') }}</div>
           <div v-if="item.role === 'assistant' && item.citations.length" class='document-ai__citations'>
@@ -697,9 +742,10 @@ onBeforeUnmount(() => {
         <button v-if='pickerSelection.length' type='button' class='document-ai__add-selected' @click='addSources(pickerSelection)'>添加 {{ pickerSelection.length }} 份文档</button>
       </div>
       <div v-if='mentionCandidates.length' class='document-ai__mention-picker'><span>输入 @ 选择或添加文档</span><button v-for='source in mentionCandidates' :key='documentInsightSourceId(source)' type='button' @click='selectMention(source)'><FileText :size='14' />@{{ source.file.name || source.file.file_name }}</button></div>
-      <textarea v-model='question' :disabled='asking' placeholder='Ask BoxPlayer AI · 输入 @ 提及文件' rows='1' @keydown.meta.enter.prevent='ask()' @keydown.ctrl.enter.prevent='ask()' @keydown.enter.exact.prevent='ask()'></textarea>
+      <textarea v-model='question' :disabled='asking' placeholder='询问这份文档…' rows='1' @keydown.meta.enter.prevent='ask()' @keydown.ctrl.enter.prevent='ask()' @keydown.enter.exact.prevent='ask()'></textarea>
       <button v-if='asking' type='button' class='document-ai__stop-answer' title='停止回答' @click='stopAnswer'><X :size='18' /></button>
       <button v-else type='button' :disabled='!question.trim()' title='发送' @click='ask()'><ArrowUp :size='18' /></button>
+      <div class='document-ai__composer-hint'><span>仅基于已选文档回答</span><kbd>↵</kbd><span>发送</span><kbd>⇧↵</kbd><span>换行</span></div>
     </footer>
   </aside>
   <LimitReachedModal :visible="showUpgradeModal" @update:visible="showUpgradeModal = $event" />
@@ -707,8 +753,8 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .document-ai { position:relative; display:flex; width:340px; min-width:300px; height:100%; flex-direction:column; overflow:hidden; border-left:1px solid #e7e8ee; color:#17181d; background:#fff; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }.document-ai--workspace { width:100%; min-width:0; border:0; border-radius:0; }.document-ai--expanded { position:fixed; z-index:2200; inset:0; width:100vw; min-width:0; height:100vh; border:0; border-radius:0; }.document-ai__header { display:flex; height:68px; min-height:68px; align-items:center; justify-content:space-between; padding:0 32px; border-bottom:1px solid #ececf1; }.document-ai__brand,.document-ai__header-actions,.document-ai__brand-icon { display:inline-flex; align-items:center; }.document-ai__brand { gap:8px; font-size:14px; font-weight:700; }.document-ai__brand-icon,.document-ai__hero-icon { justify-content:center; color:#fff; background:linear-gradient(135deg,#ff3fd8 0%,#7a5cff 48%,#39a7ff 100%); }.document-ai__brand-icon { width:28px; height:28px; border-radius:9px; }.document-ai__agent { padding:2px 7px; border:1px solid #cf8cff; border-radius:999px; color:#9b4ee4; font-size:10px; letter-spacing:.5px; }.document-ai__header-actions { gap:5px; }.document-ai__header-actions button,.document-ai__response-actions button { display:inline-grid; width:30px; height:30px; place-items:center; border:0; border-radius:7px; color:#6d7180; background:transparent; cursor:pointer; }.document-ai__header-actions button:hover,.document-ai__response-actions button:hover { color:#343844; background:#f3f2f8; }.document-ai__body { min-height:0; flex:1; overflow-y:auto; }.document-ai__context { display:flex; position:relative; gap:10px; align-items:flex-start; padding:16px 24px; border-bottom:1px solid #f0f0f3; color:#676b78; }.document-ai__context>svg { margin-top:1px; color:#6659eb; }.document-ai__context div { display:grid; gap:3px; min-width:0; }.document-ai__context strong { overflow:hidden; color:#242631; font-size:14px; text-overflow:ellipsis; white-space:nowrap; }.document-ai__context span { color:#828593; font-size:11px; line-height:1.4; }.document-ai__sources-link { justify-self:start; padding:0; border:0; color:#705ce6; background:transparent; cursor:pointer; font-size:12px; font-weight:600; }.document-ai__sources-popover { display:grid; position:absolute; z-index:4; top:66px; left:24px; width:min(520px,calc(100vw - 48px)); gap:1px; padding:8px; border:1px solid #e3e1ee; border-radius:12px; background:#fff; box-shadow:0 16px 35px rgba(32,27,61,.16); }.document-ai__source-row { display:grid; grid-template-columns:18px minmax(0,1fr) auto 26px; gap:7px; align-items:center; padding:8px; color:#656979; font-size:12px; }.document-ai__source-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.document-ai__source-row small.ready { color:#2a9f65; }.document-ai__source-row small.failed { color:#c65353; }.document-ai__source-row button { display:grid; place-items:center; border:0; color:#868a96; background:transparent; cursor:pointer; }.document-ai__reading-map { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; max-width:900px; margin:0 auto; padding:0 60px 10px; color:#656979; font-size:11px; }.document-ai__reading-map>div { display:grid; gap:2px; }.document-ai__reading-map strong { color:#3b3e49; font-size:12px; }.document-ai__reading-map>button { align-self:start; padding:5px 8px; border:1px solid #b9adfb; border-radius:6px; color:#6753d9; background:#fff; cursor:pointer; font:inherit; font-size:11px; }.document-ai__reading-map ol { display:grid; grid-column:1/-1; grid-template-columns:repeat(auto-fit,minmax(132px,1fr)); gap:5px; margin:0; padding:0; list-style:none; }.document-ai__reading-map li { display:grid; gap:2px; padding:6px 8px; border:1px solid #e8e8ed; border-radius:7px; }.document-ai__reading-map li small { color:#878a96; font-size:10px; }.document-ai__reading-unit--completed { border-color:#b9ead1 !important; background:#f3fcf7; }.document-ai__reading-unit--failed { border-color:#f1c6c6 !important; background:#fff8f8; }.document-ai__empty { display:flex; min-height:330px; flex-direction:column; align-items:center; justify-content:center; padding:36px 25px; text-align:center; }.document-ai__hero-icon { display:grid; width:52px; height:52px; place-items:center; margin-bottom:18px; border-radius:17px; box-shadow:0 8px 18px rgba(106,86,235,.22); }.document-ai__empty h2 { margin:0; color:#22242d; font-size:17px; letter-spacing:-.2px; }.document-ai__empty p { margin:9px 0 18px; color:#858895; font-size:12px; line-height:1.65; }.document-ai__suggestions { display:grid; width:100%; max-width:340px; gap:8px; }.document-ai__suggestions button { min-height:42px; padding:0 13px; border:1px solid #e5e5ec; border-radius:9px; color:#343641; background:#fff; cursor:pointer; font-size:12px; text-align:left; }.document-ai__suggestions button:hover:not(:disabled) { border-color:#ab9dff; background:#faf9ff; }.document-ai__suggestions button:disabled { color:#a3a5ae; cursor:not-allowed; }.document-ai__deep-reading { display:grid; width:100%; max-width:340px; gap:7px; margin-top:20px; padding:14px; border:1px solid #e6e2fa; border-radius:10px; color:#595d6d; background:#fbfaff; font-size:11px; text-align:left; }.document-ai__deep-reading strong { color:#383b47; font-size:12px; }.document-ai__deep-reading button { justify-self:start; padding:7px 10px; border:1px solid #ac9cff; border-radius:7px; color:#6855da; background:#fff; cursor:pointer; font:inherit; font-size:11px; font-weight:600; }.document-ai__conversation { display:grid; gap:20px; max-width:900px; margin:0 auto; padding:34px 60px 48px; }.document-ai__message { display:grid; gap:9px; max-width:100%; }.document-ai__message--user { justify-items:end; }.document-ai__message-text { color:#292b35; font-size:14px; line-height:1.75; white-space:pre-wrap; }.document-ai__message--user .document-ai__message-text { max-width:min(80%,420px); padding:12px 16px; border-radius:19px 19px 4px 19px; background:#f0ecff; }.document-ai__citations { display:flex; flex-wrap:wrap; align-items:center; gap:5px; color:#858895; font-size:11px; }.document-ai__citation-wrap { position:relative; }.document-ai__citations button { min-width:20px; height:20px; padding:0 6px; border:1px solid #e0dcf7; border-radius:999px; color:#725dea; background:#faf9ff; cursor:pointer; font-size:10px; }.document-ai__citation-popover { display:grid; position:absolute; z-index:7; bottom:27px; left:0; width:min(330px,calc(100vw - 48px)); gap:4px; padding:10px; border:1px solid #e3e1ee; border-radius:10px; color:#555967; background:#fff; box-shadow:0 12px 28px rgba(32,27,61,.18); font-size:11px; line-height:1.45; }.document-ai__citation-popover strong { color:#373a46; font-size:11px; }.document-ai__response-actions { display:flex; gap:1px; margin-top:-4px; }.document-ai__composer { display:flex; position:relative; align-items:flex-end; gap:8px; padding:12px 20px 16px; border-top:1px solid #eeeeF3; background:#fff; }.document-ai__composer textarea { width:100%; min-height:48px; max-height:120px; resize:vertical; padding:13px 42px 10px 15px; border:1.5px solid #c3b5ff; border-radius:24px; outline:none; color:#292b35; background:#fff; box-shadow:inset 0 0 0 1px rgba(114,93,234,.06); font:inherit; font-size:13px; line-height:1.35; }.document-ai__composer textarea:focus { border-color:#8067ff; box-shadow:0 0 0 3px rgba(128,103,255,.12); }.document-ai__composer textarea:disabled { color:#9d9fa9; background:#f7f7f8; }.document-ai__composer>button:not(.document-ai__add-source) { display:grid; width:34px; height:34px; flex:0 0 34px; place-items:center; margin-left:-48px; margin-bottom:7px; border:0; border-radius:50%; color:#fff; background:linear-gradient(135deg,#e58fff,#8c69ff 52%,#48a1ff); cursor:pointer; }.document-ai__composer>button:disabled { opacity:.38; cursor:not-allowed; }.document-ai__add-source { display:grid; width:32px; height:32px; flex:0 0 auto; place-items:center; margin-bottom:8px; border:0; border-radius:50%; color:#695be8; background:#f1eeff; cursor:pointer; }.document-ai__source-picker,.document-ai__mention-picker { display:grid; position:absolute; z-index:5; bottom:76px; left:24px; width:min(360px,calc(100vw - 48px)); gap:4px; padding:10px; border:1px solid #e3e1ee; border-radius:12px; background:#fff; box-shadow:0 16px 35px rgba(32,27,61,.16); }.document-ai__source-picker strong { font-size:12px; }.document-ai__source-picker small { margin-bottom:5px; color:#858895; font-size:10px; }.document-ai__picker-label { padding:4px 8px; color:#696d7b; font-size:11px; font-weight:600; }.document-ai__cloud-search { display:flex; gap:4px; padding:0 4px 4px; }.document-ai__cloud-search input { min-width:0; flex:1; padding:7px 8px; border:1px solid #e5e5ec; border-radius:7px; outline:0; color:#3e414c; font:inherit; font-size:11px; }.document-ai__cloud-search input:focus { border-color:#ae9dff; }.document-ai__cloud-search button { display:grid; width:30px; padding:0; place-items:center; }.document-ai__source-picker button,.document-ai__mention-picker button { display:flex; gap:8px; align-items:center; min-width:0; padding:8px; border:0; border-radius:7px; color:#4b4e58; background:transparent; cursor:pointer; text-align:left; }.document-ai__source-picker button:hover,.document-ai__mention-picker button:hover { background:#f6f4ff; }.document-ai__source-picker button span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.document-ai__source-picker p { margin:5px 0; color:#858895; font-size:11px; }.document-ai__mention-picker { bottom:74px; }.document-ai__feedback { position:absolute; right:20px; bottom:76px; max-width:calc(100% - 40px); color:#777a87; font-size:11px; }.document-ai--workspace .document-ai__body { width:100%; }.document-ai--workspace .document-ai__context { max-width:960px; margin:0 auto; padding-top:25px; border-bottom:0; }.document-ai--workspace .document-ai__empty { min-height:420px; }.document-ai--workspace .document-ai__composer { max-width:960px; width:100%; align-self:center; box-sizing:border-box; border-top:0; }.document-ai--workspace .document-ai__header { padding-right:32px; padding-left:32px; }@media (max-width:760px) { .document-ai { width:320px; min-width:280px; }.document-ai--workspace .document-ai__conversation { padding:22px; }.document-ai--workspace .document-ai__context { padding:20px; }.document-ai--workspace .document-ai__header { padding:0 16px; } }
-.document-ai { --document-ai-bg:var(--color-bg-1); --document-ai-surface:var(--color-bg-2); --document-ai-line:var(--color-border-2); --document-ai-text:var(--color-text-1); --document-ai-muted:var(--color-text-3); --document-ai-hover:var(--color-fill-2); --document-ai-input:var(--color-bg-2); --document-ai-popover:var(--color-bg-3); -webkit-app-region:no-drag; color:var(--document-ai-text); background:var(--document-ai-bg); border-left-color:var(--document-ai-line); }
-:global(body[arco-theme='dark']) .document-ai { --document-ai-bg:#10151e; --document-ai-surface:#151c28; --document-ai-line:rgba(143,157,189,.2); --document-ai-text:#edf1fb; --document-ai-muted:#9ba7bb; --document-ai-hover:rgba(255,255,255,.075); --document-ai-input:#121924; --document-ai-popover:#161c28; background:radial-gradient(circle at 92% 0%,rgba(35,113,94,.2),transparent 31%),linear-gradient(145deg,#121720,#090c12); }
+.document-ai { --document-ai-bg:var(--color-bg-1); --document-ai-surface:var(--color-bg-2); --document-ai-line:var(--color-border-2); --document-ai-text:var(--color-text-1); --document-ai-muted:var(--color-text-3); --document-ai-hover:var(--color-fill-2); --document-ai-input:var(--color-bg-2); --document-ai-popover:var(--app-overlay-bg); -webkit-app-region:no-drag; color:var(--document-ai-text); background:var(--document-ai-bg); border-left-color:var(--document-ai-line); }
+:global(body[arco-theme='dark']) .document-ai { --document-ai-bg:#10151e; --document-ai-surface:#151c28; --document-ai-line:rgba(143,157,189,.2); --document-ai-text:#edf1fb; --document-ai-muted:#9ba7bb; --document-ai-hover:rgba(255,255,255,.075); --document-ai-input:#121924; --document-ai-popover:var(--app-overlay-bg); background:radial-gradient(circle at 92% 0%,rgba(35,113,94,.2),transparent 31%),linear-gradient(145deg,#121720,#090c12); }
 .document-ai--workspace { border:1px solid var(--document-ai-line); border-radius:15px; background:var(--document-ai-bg); }.document-ai--expanded { border:0; border-radius:0; }
 :global(body[arco-theme='dark']) .document-ai--workspace { background:radial-gradient(circle at 74% 0%,rgba(13,102,84,.25),transparent 38%),linear-gradient(145deg,#151a24,#090c12); box-shadow:inset 0 1px 0 rgba(255,255,255,.035); }
 .document-ai__header,.document-ai__composer { border-color:var(--document-ai-line); background:var(--document-ai-bg); }.document-ai__brand,.document-ai__context strong,.document-ai__empty h2,.document-ai__reading-map strong,.document-ai__deep-reading strong,.document-ai__citation-popover strong { color:var(--document-ai-text); }.document-ai__header-actions button,.document-ai__response-actions button,.document-ai__context,.document-ai__context span,.document-ai__reading-map,.document-ai__deep-reading,.document-ai__citations,.document-ai__feedback,.document-ai__picker-label { color:var(--document-ai-muted); }.document-ai__header-actions button:hover,.document-ai__response-actions button:hover,.document-ai__source-picker button:hover,.document-ai__mention-picker button:hover { color:var(--document-ai-text); background:var(--document-ai-hover); }
@@ -752,4 +798,119 @@ onBeforeUnmount(() => {
 .document-ai__reading-map { max-width:820px; padding:4px 48px 12px; font-size:12px; }.document-ai__reading-map strong { font-size:13px; }.document-ai__reading-map ol { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }.document-ai__reading-map li { padding:7px 9px; }.document-ai__reading-notes { max-width:820px; padding:8px 48px 26px; }.document-ai__reading-notes-heading strong { font-size:14px; }.document-ai__reading-notes-heading span,.document-ai__reading-note>small { font-size:12px; }.document-ai__reading-note { padding:15px 16px; border-radius:9px; }
 :deep(.document-ai__message-markdown h1) { font-size:22px; }.document-ai__message-markdown h2 { font-size:18px; }.document-ai__message-markdown h3 { font-size:16px; }.document-ai__message-markdown h4 { font-size:15px; }:deep(.document-ai__message-markdown h1),:deep(.document-ai__message-markdown h2),:deep(.document-ai__message-markdown h3),:deep(.document-ai__message-markdown h4) { margin:28px 0 11px; font-weight:700; }.document-ai__message-markdown p { margin-bottom:15px; }
 @media (max-width:760px) { .document-ai__header { padding:0 16px; }.document-ai__context,.document-ai__empty,.document-ai__conversation,.document-ai__reading-map,.document-ai__reading-notes { padding-right:20px !important; padding-left:20px !important; }.document-ai__empty { padding-top:42px; }.document-ai__suggestions { grid-template-columns:1fr; }.document-ai__conversation { padding-top:24px; }.document-ai__composer { padding-right:16px; padding-left:16px; }.document-ai__message-text,.document-ai__message-markdown { font-size:14px; } }
+
+/* Keep PDF question-answering visually aligned with the book reader while
+   preserving its page-level citations and source controls. */
+.document-ai__context {
+  margin:12px auto 0;
+  border:1px solid var(--document-ai-line);
+  border-radius:9px;
+  background:var(--document-ai-surface);
+}
+.document-ai__resize-handle {
+  position:absolute;
+  z-index:20;
+  top:0;
+  bottom:0;
+  left:-5px;
+  width:10px;
+  cursor:col-resize;
+  touch-action:none;
+}
+.document-ai__resize-handle::after {
+  position:absolute;
+  top:50%;
+  left:3px;
+  width:3px;
+  height:42px;
+  border-radius:999px;
+  background:transparent;
+  content:'';
+  transform:translateY(-50%);
+  transition:background .16s ease, height .16s ease;
+}
+.document-ai__resize-handle:hover::after,
+.document-ai--resizing .document-ai__resize-handle::after {
+  height:58px;
+  background:rgb(var(--primary-6));
+}
+.document-ai--resizing {
+  transition:none !important;
+}
+.document-ai--sidebar .document-ai__context {
+  margin:10px 12px 0;
+  padding:11px 12px !important;
+}
+.document-ai__message-meta {
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  color:var(--document-ai-muted);
+  font-size:11px;
+  font-weight:650;
+}
+.document-ai__message-rule {
+  padding:2px 6px;
+  border-radius:999px;
+  color:rgb(var(--primary-6));
+  background:rgba(var(--primary-6),.09);
+  font-size:10px;
+  font-weight:600;
+}
+.document-ai__message--assistant .document-ai__message-text {
+  box-sizing:border-box;
+  padding:13px 15px;
+  border:1px solid var(--document-ai-line);
+  border-radius:4px 12px 12px 12px;
+  background:var(--document-ai-surface);
+  box-shadow:0 1px 2px rgba(0,0,0,.04);
+}
+.document-ai__message--assistant .document-ai__citations {
+  margin-top:-2px;
+}
+.document-ai__composer {
+  padding-bottom:33px;
+}
+.document-ai__composer-hint {
+  display:flex;
+  position:absolute;
+  right:24px;
+  bottom:8px;
+  left:24px;
+  align-items:center;
+  gap:5px;
+  color:var(--document-ai-muted);
+  font-size:10px;
+  line-height:1.35;
+  pointer-events:none;
+}
+.document-ai__composer-hint > span:first-child {
+  margin-right:auto;
+}
+.document-ai__composer-hint kbd {
+  min-width:15px;
+  padding:0 3px;
+  border:1px solid var(--document-ai-line);
+  border-bottom-width:2px;
+  border-radius:3px;
+  color:var(--document-ai-muted);
+  font:inherit;
+  text-align:center;
+}
+@media (max-width:760px) {
+  .document-ai__composer-hint { right:16px; left:16px; }
+  .document-ai__composer-hint > span:first-child { display:none; }
+}
+
+.document-ai--sidebar .document-ai__header { padding:0 18px; }
+.document-ai--sidebar .document-ai__empty { width:100%; box-sizing:border-box; padding:32px 22px 24px; }
+.document-ai--sidebar .document-ai__empty h2 { font-size:19px; line-height:1.45; }
+.document-ai--sidebar .document-ai__empty p { font-size:13px; }
+.document-ai--sidebar .document-ai__suggestions { width:100%; }
+.document-ai--sidebar .document-ai__suggestions button { padding:10px 12px; text-align:left; }
+.document-ai--sidebar .document-ai__context strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.document-ai--sidebar .document-ai__context>div { min-width:0; }
+.document-ai--sidebar .document-ai__conversation { padding:24px 20px 32px; }
+.document-ai--sidebar .document-ai__composer { padding:12px 16px 33px; }
+.document-ai--sidebar .document-ai__composer-hint { left:16px; right:16px; }
 </style>

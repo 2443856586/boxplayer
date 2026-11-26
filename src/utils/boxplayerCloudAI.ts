@@ -14,23 +14,36 @@ export interface BoxPlayerCloudChatRequest {
 }
 
 export interface BoxPlayerCloudMediaScrapeItem {
-  id?: string
+  id: string
   filename: string
-  folderHint?: string
-  pathHint?: string
+  context?: string | null
 }
 
 export interface BoxPlayerCloudMediaScrapeResult {
-  idx?: number
-  id?: string | null
-  type?: 'movie' | 'tv' | null
-  title?: string | null
-  year?: number | null
-  tmdb_id?: number | null
-  season?: number | null
-  episode?: number | null
-  confidence?: number | null
-  alt_titles?: string[] | null
+  idx: number
+  id: string
+  type: 'movie' | 'tv'
+  title: string
+  year: number | null
+  season: number | null
+  episode: number | null
+  episodes: number[] | null
+  confidence: number
+  alt_titles: string[]
+}
+
+export interface BoxPlayerCloudMediaScrapeResponse {
+  requestId?: string
+  outcome: 'complete' | 'rejected' | 'error'
+  retryable: boolean
+  results: BoxPlayerCloudMediaScrapeResult[]
+  rejected: Array<{ code?: string }>
+}
+
+export class BoxPlayerMediaScrapeError extends Error {
+  constructor(message: string, readonly retryable: boolean, readonly outcome: 'rejected' | 'error' = 'error') {
+    super(message)
+  }
 }
 
 export interface BoxPlayerCloudStreamCallbacks {
@@ -50,7 +63,7 @@ function apiUrl(path: string): string {
 }
 
 export function getBoxPlayerMediaScrapeUrl(): string {
-  return `${Config.BOXPLAYER_API_URL.replace(/\/+$/, '')}/v1/media-scrape`
+  return `${Config.BOXPLAYER_API_URL.replace(/\/+$/, '')}/v2/media-scrape`
 }
 
 async function postCloudAI(path: string, body: unknown): Promise<Response> {
@@ -112,7 +125,7 @@ export async function completeBoxPlayerCloudChat(request: BoxPlayerCloudChatRequ
   return text
 }
 
-export async function scrapeMediaWithBoxPlayerCloud(items: BoxPlayerCloudMediaScrapeItem[], signal?: AbortSignal): Promise<BoxPlayerCloudMediaScrapeResult[]> {
+export async function scrapeMediaWithBoxPlayerCloud(items: BoxPlayerCloudMediaScrapeItem[], signal?: AbortSignal): Promise<BoxPlayerCloudMediaScrapeResponse> {
   const token = await getBoxPlayerAccessToken()
   const response = await fetch(getBoxPlayerMediaScrapeUrl(), {
     method: 'POST',
@@ -121,12 +134,22 @@ export async function scrapeMediaWithBoxPlayerCloud(items: BoxPlayerCloudMediaSc
       'Content-Type': 'application/json'
     },
     signal,
-    body: JSON.stringify({ items })
+    body: JSON.stringify({ contractVersion: 2, items })
   })
-  if (!response.ok) throw new Error(await readCloudAIError(response))
-  const data = await response.json() as { results?: BoxPlayerCloudMediaScrapeResult[] }
-  if (!Array.isArray(data.results)) throw new Error('AI 刮削没有返回结果')
-  return data.results
+  let data: Partial<BoxPlayerCloudMediaScrapeResponse> = {}
+  try {
+    data = await response.json()
+  } catch {}
+  const outcome = data.outcome === 'complete' || data.outcome === 'rejected' || data.outcome === 'error' ? data.outcome : 'error'
+  const retryable = data.retryable === true
+  if (!response.ok || outcome !== 'complete') {
+    const code = data.rejected?.[0]?.code
+    throw new BoxPlayerMediaScrapeError(mapBoxPlayerCloudAIError(code || `HTTP ${response.status}`), retryable, outcome === 'rejected' ? 'rejected' : 'error')
+  }
+  if (!Array.isArray(data.results) || !Array.isArray(data.rejected)) {
+    throw new BoxPlayerMediaScrapeError('AI 刮削返回格式无效', false)
+  }
+  return data as BoxPlayerCloudMediaScrapeResponse
 }
 
 function detectSourceLang(text: string): string {
@@ -206,9 +229,10 @@ export function mapBoxPlayerCloudAIError(error: unknown): string {
   // Pi's OpenAI-compatible stream reports body-less HTTP failures as a status
   // string. The cloud worker reserves 429 exclusively for the monthly credit limit.
   if (/\b429\b/.test(code)) return '本月内置 AI 额度已用完。你可以等待下月重置，或在设置中改用自己的 AI API Key。'
-  // The current Cloudflare streaming bridge can surface the same rejected
-  // request as a body-less 500 even though the Worker records the quota code.
-  if (/\b500 status code \(no body\)/.test(code)) return '本月内置 AI 额度已用完。你可以等待下月重置，或在设置中改用自己的 AI API Key。'
+  // A body-less 500 is an upstream model/bridge failure, not evidence that a
+  // user's quota was exhausted. Quota exhaustion is always returned as a 429
+  // or an explicit quota code by our Worker.
+  if (/\b500 status code \(no body\)/.test(code)) return '内置 AI 模型服务执行失败，请稍后重试。'
   return code
 }
 

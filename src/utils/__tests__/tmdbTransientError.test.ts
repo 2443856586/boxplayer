@@ -29,7 +29,7 @@ describe('TMDB scrape error classification', () => {
     try {
       const fetchMock = vi.fn()
         .mockResolvedValueOnce({ ok: false, status: 429, headers: new Headers({ 'retry-after': '1' }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ code: 0, data: { id: 1, title: 'Arrival' } }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ code: 0, data: { id: 1, title: 'Arrival', certification: 'PG-13' } }) })
       vi.stubGlobal('fetch', fetchMock)
 
       const result = TmdbService.getInstance().searchMovie('Arrival')
@@ -39,6 +39,26 @@ describe('TMDB scrape error classification', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2)
     } finally {
       vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
+  it('times out a stalled response body and preserves a retryable outcome', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      vi.stubGlobal('fetch', vi.fn(async (_url, init) => ({
+        ok: true,
+        json: () => new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))
+        })
+      })))
+      const result = expect(TmdbService.getInstance().searchMovie('Arrival')).rejects.toBeInstanceOf(TmdbTransientError)
+      await vi.advanceTimersByTimeAsync(45_000)
+      await result
+    } finally {
+      vi.unstubAllGlobals()
+      vi.restoreAllMocks()
       vi.useRealTimers()
     }
   })

@@ -26,14 +26,19 @@ async function resolveTokenForFile(file: IAliGetFileModel): Promise<ITokenInfo |
 
 function buildSiblingVideoPlaylist(file: IAliGetFileModel, userId: string, tokenfrom: string, provided?: IPageVideoPlaylistEntry[]): IPageVideoPlaylistEntry[] {
   if (provided && provided.length > 0) return provided.map((item) => ({ ...item, tokenfrom: item.tokenfrom || tokenfrom }))
-  const rawItems = usePanFileStore().ListDataRaw || []
-  const visibleItems = rawItems.filter((item: any) => !item.isDir)
-  const sameDirectory = visibleItems.filter((item: any) => item.parent_file_id === file.parent_file_id)
-  const candidates = (sameDirectory.length > 1 ? sameDirectory : visibleItems).filter(isVideoFile)
+  const store = usePanFileStore()
+  const rawItems = store.ListDataRaw || []
+  // Preserve the order selected in the file browser. Only fall back to the
+  // complete directory when this item was opened outside the visible list.
+  const shownItems = store.ListDataShow || []
+  const isShown = shownItems.some((item: any) => item.file_id === file.file_id && item.drive_id === file.drive_id)
+  const sourceItems = isShown ? shownItems : rawItems
+  const visibleItems = sourceItems.filter((item: any) => !item.isDir)
+  const candidates = visibleItems.filter((item: any) => item.parent_file_id === file.parent_file_id && item.drive_id === file.drive_id).filter(isVideoFile)
   if (!candidates.some((item: any) => item.file_id === file.file_id)) candidates.push(file)
   if (candidates.length <= 1) return []
+  if (!isShown) candidates.sort((left: any, right: any) => String(left.name || left.file_name || '').localeCompare(String(right.name || right.file_name || ''), undefined, { numeric: true, sensitivity: 'base' }))
   return candidates
-    .sort((left: any, right: any) => String(left.name || left.file_name || '').localeCompare(String(right.name || right.file_name || ''), undefined, { numeric: true, sensitivity: 'base' }))
     .map((item: any): IPageVideoPlaylistEntry => ({
       user_id: userId,
       tokenfrom,
@@ -104,6 +109,7 @@ export async function menuOpenFile(
   options?: {
     customPlaylistLabel?: string
     customPlaylist?: IPageVideoPlaylistEntry[]
+    playlistLoop?: boolean
   }
 ): Promise<void> {
   if (clickWait('menuOpenFile', 500)) return
@@ -187,7 +193,7 @@ export async function menuOpenFile(
     // 选择字幕
     let subTitleFile: any
     const { uiVideoPlayer, uiVideoSubtitleMode } = useSettingStore()
-    const useMacEmbeddedMpv = uiVideoPlayer === 'mpv' && window.platform === 'darwin'
+    const useMacEmbeddedMpv = uiVideoPlayer === 'mpv'
     const listDataRaw: IAliGetFileModel[] = usePanFileStore().ListDataRaw || []
     const subTitlesList: IAliGetFileModel[] = listDataRaw.filter((file) => /srt|vtt|ass/.test(file.ext))
     if (uiVideoPlayer !== 'web' && !useMacEmbeddedMpv) {
@@ -281,6 +287,7 @@ async function Video(
   options?: {
     customPlaylistLabel?: string
     customPlaylist?: IPageVideoPlaylistEntry[]
+    playlistLoop?: boolean
   }
 ): Promise<void> {
   if (file.icon == 'iconweifa') {
@@ -296,15 +303,17 @@ async function Video(
     uiVideoPlayer,
     uiVideoPlayerPath
   } = useSettingStore()
-  if (uiVideoPlayer === 'mpv' && window.platform !== 'darwin') {
-    useSettingStore().updateStore({ uiVideoPlayer: 'other' })
-    message.error('内置 MPV 仅支持 macOS，请在设置中选择“自定义播放软件”并指定播放器路径。')
-    return
+  if (uiVideoPlayer === 'mpv') {
+    const capability = await window.WebMpvEmbeddedCapability?.()
+    if (!capability?.enabled) {
+      message.error(capability?.reason || '当前平台的内置 MPV 资源尚未就绪，请改用内置网页播放器。')
+      return
+    }
   }
   if (uiAutoColorVideo && !isPikPakUser(token) && !isDropboxUser(token) && !isOneDriveUser(token) && !isBoxUser(token) && file.drive_id !== 'pikpak' && file.drive_id !== 'dropbox' && file.drive_id !== 'onedrive' && file.drive_id !== 'box' && (!desc || !desc.includes('ce74c3c'))) {
     AliFileCmd.ApiFileColorBatch(token.user_id, file.drive_id, file.description, 'ce74c3c', [file.file_id])
   }
-  if (uiVideoPlayer == 'web' || (uiVideoPlayer === 'mpv' && window.platform === 'darwin')) {
+  if (uiVideoPlayer == 'web' || uiVideoPlayer === 'mpv') {
     let play_cursor = 0
     let playCursorInfo = await PlayerUtils.getPlayCursor(token.user_id, file.drive_id, file.file_id)
     if (playCursorInfo) {
@@ -341,6 +350,7 @@ async function Video(
       encType: getEncType(playCursorInfo?.info || ''),
       play_cursor: play_cursor,
       custom_playlist_label: options?.customPlaylistLabel || '',
+      playlist_loop: options?.playlistLoop,
       custom_playlist: buildSiblingVideoPlaylist(file, token.user_id, token.tokenfrom === 'unknown' ? 'aliyun' : token.tokenfrom, options?.customPlaylist),
       library_subtitle_files: librarySubtitleFiles
     }

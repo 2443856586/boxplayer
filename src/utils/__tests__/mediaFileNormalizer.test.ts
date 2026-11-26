@@ -25,12 +25,19 @@ describe('MediaFileNormalizer', () => {
 
   it('does not mistake titles for episode markers or discard sequel numbers', () => {
     expect(normalizer.normalize('Se7en.1995.mkv')).toMatchObject({
-      searchTitle: 'se7en 1995',
+      searchTitle: 'se7en', releaseYear: 1995,
       seasonNumber: undefined,
       episodeNumber: undefined
     })
-    expect(normalizer.normalize('1917.mkv')).toMatchObject({ cleanedTitle: '1917', searchTitle: undefined })
-    expect(normalizer.normalize('流浪地球 2 2023.mkv').searchTitle).toBe('流浪地球 2 2023')
+    expect(normalizer.normalize('1917.mkv', '/Movies/1917.mkv')).toMatchObject({ cleanedTitle: '1917', searchTitle: '1917' })
+    expect(normalizer.normalize('流浪地球 2 2023.mkv').searchTitle).toBe('流浪地球 2')
+  })
+
+  it('extracts years with spaces or dots while preserving numeric film titles', () => {
+    for (const name of ['Dune 2021.mkv', 'Dune.2021.mkv', 'Dune 2021 1080p.mkv']) {
+      expect(normalizer.normalize(name)).toMatchObject({ searchTitle: 'dune', releaseYear: 2021 })
+    }
+    expect(normalizer.normalize('2012.mkv')).toMatchObject({ searchTitle: '2012', releaseYear: undefined })
   })
 
   it('supports alternate, numeric and Chinese episode formats', () => {
@@ -40,6 +47,9 @@ describe('MediaFileNormalizer', () => {
   })
 
   it('uses folder context for numeric and marker-only episode names', () => {
+    for (const name of ['EP03.mkv', '03.1080p.mkv']) {
+      expect(normalizer.normalize(name, `/Library/My Show/Season 02/${name}`)).toMatchObject({ searchTitle: 'my show', seasonNumber: 2, episodeNumber: 3 })
+    }
     expect(normalizer.normalize('03.mkv', '/Library/My Show/Season 02/03.mkv')).toMatchObject({
       searchTitle: 'my show',
       seasonNumber: 2,
@@ -50,5 +60,14 @@ describe('MediaFileNormalizer', () => {
       seasonNumber: 1,
       episodeNumber: 1
     })
+    expect(normalizer.normalize('07.mp4', '/不限速 最全库11111/剧集/欧美剧集/美剧 金斯敦市长 第四季 2025/07.mp4')).toMatchObject({
+      searchTitle: '金斯敦市长',
+      seasonNumber: 4,
+      episodeNumber: 7
+    })
+  })
+
+  it('retains every episode in a multi-episode release', () => {
+    expect(normalizer.normalize('Show.S01E01-E03.mkv')).toMatchObject({ searchTitle: 'show', seasonNumber: 1, episodeNumber: 1, episodeNumbers: [1, 2, 3] })
   })
 })

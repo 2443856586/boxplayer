@@ -12,7 +12,9 @@
 #include <OpenGL/CGLIOSurface.h>
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <array>
 #include <iostream>
+#include <vector>
 
 namespace mpv_texture {
 
@@ -22,6 +24,7 @@ struct IOSurfaceSlot {
     IOSurfaceRef ioSurface = nullptr;
     GLuint glTexture = 0;
     GLuint glFBO = 0;
+    std::weak_ptr<void> lease;
 };
 
 class IOSurfaceTextureShare : public ITextureShare {
@@ -52,7 +55,7 @@ public:
 
         for (int i = 0; i < BUFFER_COUNT; i++) {
             if (!createSlot(m_slots[i], width, height)) {
-                for (int j = 0; j < i; j++) {
+                for (int j = 0; j <= i; j++) {
                     destroySlot(m_slots[j]);
                 }
                 return false;
@@ -70,9 +73,9 @@ public:
             return true;
         }
 
-        for (int i = 0; i < BUFFER_COUNT; i++) {
-            destroySlot(m_slots[i]);
-        }
+        // Exported frames retain their own IOSurface reference. Retire only
+        // GL objects here; the last consumer releases the underlying surface.
+        for (auto& slot : m_slots) destroySlot(slot);
 
         return createTexture(width, height);
     }
@@ -86,7 +89,16 @@ public:
     }
 
     bool lockTexture() override {
-        if (!m_slots[m_writeIndex].ioSurface) return false;
+        bool available = false;
+        for (int offset = 0; offset < BUFFER_COUNT; ++offset) {
+            int index = (m_writeIndex + offset) % BUFFER_COUNT;
+            if (m_slots[index].ioSurface && m_slots[index].lease.expired()) {
+                m_writeIndex = index;
+                available = true;
+                break;
+            }
+        }
+        if (!available) return false;
         // No IOSurfaceLock needed — GPU-to-GPU sharing uses glFlush for sync
         m_locked = true;
         return true;
@@ -103,6 +115,31 @@ public:
 
         auto& slot = m_slots[m_writeIndex];
 
+        if (m_softwareReadback) {
+            auto pixels = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(m_width) * m_height * 4);
+            while (glGetError() != GL_NO_ERROR) {}
+            glBindFramebuffer(GL_FRAMEBUFFER, slot.glFBO);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(0, 0, static_cast<GLsizei>(m_width), static_cast<GLsizei>(m_height), GL_RGBA, GL_UNSIGNED_BYTE, pixels->data());
+            const bool valid = glGetError() == GL_NO_ERROR;
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            info.handle = 0;
+            info.width = m_width;
+            info.height = m_height;
+            info.format = TextureFormat::RGBA8;
+            info.is_valid = valid;
+            info.pixels = pixels;
+            m_writeIndex = (m_writeIndex + 1) % BUFFER_COUNT;
+            return info;
+        }
+
+        // Complete producer GPU work before another GL context reads it.
+        // This is conservative; a future explicit GPU fence can avoid waiting.
+        glFinish();
+        CFRetain(slot.ioSurface);
+        info.lease = std::shared_ptr<void>(slot.ioSurface, [](void* surface) { CFRelease(surface); });
+        slot.lease = info.lease;
+
         // Pass IOSurfaceRef as raw pointer — Electron's importSharedTexture expects
         // the ioSurface Buffer to contain the IOSurfaceRef pointer, not the IOSurfaceID.
         info.handle = reinterpret_cast<uint64_t>(slot.ioSurface);
@@ -117,8 +154,13 @@ public:
         return info;
     }
 
+    void setSoftwareReadback(bool enabled) override {
+        m_softwareReadback = enabled;
+        if (enabled) std::cout << "[IOSurface] Electron GPU import unavailable; using CPU frame readback" << std::endl;
+    }
+
     void releaseTexture() override {
-        // No-op with triple buffering - mpv always has a free slot to write to
+        // Export leases, rather than a global frame flag, own occupied slots.
     }
 
     void destroy() override {
@@ -127,7 +169,6 @@ public:
         for (int i = 0; i < BUFFER_COUNT; i++) {
             destroySlot(m_slots[i]);
         }
-
         m_initialized = false;
     }
 
@@ -221,11 +262,13 @@ private:
         if (slot.ioSurface) {
             CFRelease(slot.ioSurface);
             slot.ioSurface = nullptr;
+            slot.lease.reset();
         }
     }
 
     bool m_initialized = false;
     bool m_locked = false;
+    bool m_softwareReadback = false;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 

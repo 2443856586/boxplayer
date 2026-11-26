@@ -35,13 +35,31 @@ describe('BoxPlayer PI Agent runtime', () => {
   })
 
   it('forces write and destructive tools to execute sequentially', () => {
-    expect(inferToolPermission('searchMyFiles')).toBe('read')
     expect(inferToolPermission('moveFiles')).toBe('write')
     expect(inferToolPermission('deleteFiles')).toBe('destructive')
   })
 
-  it('maps a body-less cloud quota error before emitting it to a surface', () => {
-    expect(formatAgentModelError({ endpoint: '', modelId: 'cloud', apiKey: '', providerName: 'boxplayer-cloud' }, '500 status code (no body)')).toContain('本月内置 AI 额度已用完')
+  it('never treats an undeclared, unrecognized tool as a safe read', () => {
+    expect(inferToolPermission('searchMyFiles')).toBe('unknown')
+    const [tool] = toPiTools({ newDriveTool: { description: 'New tool', inputSchema: z.object({}), execute: () => ({}) } })
+    expect(tool.executionMode).toBe('sequential')
+  })
+
+  it('maps a body-less cloud model error before emitting it to a surface', () => {
+    expect(formatAgentModelError({ endpoint: '', modelId: 'cloud', apiKey: '', providerName: 'boxplayer-cloud' }, '500 status code (no body)')).toContain('模型服务执行失败')
+  })
+
+  it('rejects after reporting a model failure so visible surfaces can stop loading and show its cause', async () => {
+    const events: any[] = []
+    await expect(runBoxPlayerAgent({
+      surface: 'document',
+      model: { endpoint: '', modelId: 'cloud', apiKey: '', providerName: 'boxplayer-cloud' },
+      systemPrompt: 'Answer from the document.',
+      prompt: '总结文档',
+      streamFn: () => { throw new Error('500 status code (no body)') },
+      onEvent: event => { events.push(event) }
+    })).rejects.toThrow('模型服务执行失败')
+    expect(events).toContainEqual({ type: 'error', message: expect.stringContaining('模型服务执行失败') })
   })
 
   it('stops only repeated action-observation pairs, including A/B ping-pong', () => {
@@ -56,6 +74,7 @@ describe('BoxPlayer PI Agent runtime', () => {
       searchMyFiles: {
         description: 'Search files',
         inputSchema: z.object({ keyword: z.string() }),
+        permission: 'read',
         execute
       }
     })
@@ -75,6 +94,7 @@ describe('BoxPlayer PI Agent runtime', () => {
       scan: {
         description: 'Scan files',
         inputSchema: z.object({}),
+        permission: 'read',
         execute: (_args, context) => {
           context?.reportProgress({ phase: 'listing', current: 1 })
           expect(context?.signal).toBe(controller.signal)
@@ -93,6 +113,7 @@ describe('BoxPlayer PI Agent runtime', () => {
         description: 'Inspect target directory',
         inputSchema: z.object({}),
         allowErrorResult: true,
+        permission: 'read',
         execute: () => ({ error: 'temporary provider failure' })
       }
     })
@@ -149,6 +170,7 @@ describe('BoxPlayer PI Agent runtime', () => {
         searchMyFiles: {
           description: 'Search files',
           inputSchema: z.object({ keyword: z.string() }),
+          permission: 'read',
           execute
         }
       },
@@ -189,8 +211,8 @@ describe('BoxPlayer PI Agent runtime', () => {
       prompt: 'Choose a resource',
       maxToolCallsPerTurn: 1,
       tools: {
-        viewResourceSnapshot: { description: 'View candidates', inputSchema: z.object({}), execute: inspect },
-        inspectTargetDir: { description: 'Inspect target', inputSchema: z.object({}), execute: extraInspect }
+        viewResourceSnapshot: { description: 'View candidates', inputSchema: z.object({}), permission: 'read', execute: inspect },
+        inspectTargetDir: { description: 'Inspect target', inputSchema: z.object({}), permission: 'read', execute: extraInspect }
       },
       streamFn: () => {
         const stream = createAssistantMessageEventStream()
@@ -223,7 +245,7 @@ describe('BoxPlayer PI Agent runtime', () => {
       maxToolCallsPerTurn: 1,
       requireToolCall: true,
       tools: {
-        reportNoCoverage: { description: 'Stop', inputSchema: z.object({}), execute: () => ({ noCoverage: true }) }
+        reportNoCoverage: { description: 'Stop', inputSchema: z.object({}), permission: 'read', execute: () => ({ noCoverage: true }) }
       },
       shouldStopAfterToolResult: ({ toolName }) => toolName === 'reportNoCoverage' ? 'done' : undefined,
       streamFn: (_model, _context, options) => {
@@ -252,10 +274,10 @@ describe('BoxPlayer PI Agent runtime', () => {
         terminalTools: ['transferCandidate', 'reportNoCoverage']
       },
       tools: {
-        readSkill: { description: 'Read', inputSchema: z.object({}), execute: () => ({ body: 'rules' }) },
-        viewResourceSnapshot: { description: 'Observe', inputSchema: z.object({}), execute: () => ({ snapshotId: 'snapshot-1' }) },
-        transferCandidate: { description: 'Transfer', inputSchema: z.object({}), execute: () => ({ submitted: true }) },
-        reportNoCoverage: { description: 'Stop', inputSchema: z.object({}), execute: () => ({ noCoverage: true }) }
+        readSkill: { description: 'Read', inputSchema: z.object({}), permission: 'read', execute: () => ({ body: 'rules' }) },
+        viewResourceSnapshot: { description: 'Observe', inputSchema: z.object({}), permission: 'read', execute: () => ({ snapshotId: 'snapshot-1' }) },
+        transferCandidate: { description: 'Transfer', inputSchema: z.object({}), permission: 'read', execute: () => ({ submitted: true }) },
+        reportNoCoverage: { description: 'Stop', inputSchema: z.object({}), permission: 'read', execute: () => ({ noCoverage: true }) }
       },
       shouldStopAfterToolResult: ({ toolName }) => toolName === 'transferCandidate' ? 'done' : undefined,
       streamFn: (_model, _context, options) => {
@@ -334,5 +356,36 @@ describe('BoxPlayer PI Agent runtime', () => {
     expect(requestApproval).toHaveBeenCalledOnce()
     expect(events).toContainEqual(expect.objectContaining({ type: 'approval_required', request: expect.objectContaining({ toolName: 'moveFiles', risk: expect.any(String), approvalHash: expect.stringMatching(/^[a-f0-9]{64}$/) }) }))
     expect(execute).toHaveBeenCalledWith({ target: '/Movies' }, expect.objectContaining({ reportProgress: expect.any(Function) }))
+  })
+
+  it('blocks an undeclared tool until the user approves it', async () => {
+    const execute = vi.fn().mockResolvedValue('done')
+    const events: any[] = []
+    const requestApproval = vi.fn().mockResolvedValue(false)
+    let call = 0
+
+    await runBoxPlayerAgent({
+      surface: 'ai_search',
+      model: { endpoint: 'https://example.com/v1', modelId: 'fake', apiKey: 'key', providerName: 'fake' },
+      systemPrompt: 'Use tools.',
+      prompt: 'Tidy the drive',
+      tools: {
+        newDriveTool: { description: 'New tool without a declared permission', inputSchema: z.object({ target: z.string() }), execute }
+      },
+      requestApproval,
+      streamFn: () => {
+        const stream = createAssistantMessageEventStream()
+        queueMicrotask(() => {
+          if (call++ === 0) stream.push({ type: 'done', reason: 'toolUse', message: assistantMessage([{ type: 'toolCall', id: 'new-1', name: 'newDriveTool', arguments: { target: '/Movies' } }], 'toolUse') })
+          else stream.push({ type: 'done', reason: 'stop', message: assistantMessage([{ type: 'text', text: '已取消' }], 'stop') })
+        })
+        return stream
+      },
+      onEvent: event => { events.push(event) }
+    })
+
+    expect(requestApproval).toHaveBeenCalledOnce()
+    expect(events).toContainEqual(expect.objectContaining({ type: 'approval_required', request: expect.objectContaining({ toolName: 'newDriveTool', permission: 'unknown', risk: expect.stringContaining('未声明权限') }) }))
+    expect(execute).not.toHaveBeenCalled()
   })
 })

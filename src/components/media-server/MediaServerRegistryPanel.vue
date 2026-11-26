@@ -1,19 +1,28 @@
 <template>
   <div class="media-server-registry-panel">
+    <div v-if="embedded && submitting && !showServerModal && !showPlexResourcesModal" class="source-pending">
+      <a-spin :size="32" />
+      <p>{{ t('source.waiting') }}</p>
+      <a-button @click="emit('close')">{{ t('unified.back') }}</a-button>
+    </div>
     <AddMediaServerModal
+      :embedded="embedded"
       v-model:visible="showServerModal"
       :loading="submitting"
       :editing-server="editingServer"
       :default-type="pendingType"
       @submit="handleSubmitServer"
+      @remove="handleRemoveFromEditor"
     />
     <PlexResourcesModal
+      :embedded="embedded"
       v-model:visible="showPlexResourcesModal"
       :resources="plexResources"
       :loading="submitting"
       @confirm="handleConfirmPlexResources"
     />
 
+    <template v-if="!formOnly">
     <div class="toolbar">
       <div class="toolbar-left">
         <a-button class="toolbar-btn" @click="handleAddServer">
@@ -44,6 +53,12 @@
                 <a-doption @click="handleSortByChange('updatedAt')">{{ t('mediaServer.sortUpdated') }}</a-doption>
               </template>
             </a-dsubmenu>
+            <template v-if="registry.preferences.serverListView === 'list'">
+              <a-doption @click="toggleListOption('showAddress')">{{ registry.preferences.showAddress ? '✓ ' : '' }}{{ t('mediaServer.showAddress') }}</a-doption>
+              <a-doption @click="toggleListOption('showMediaStatistics')">{{ registry.preferences.showMediaStatistics ? '✓ ' : '' }}{{ t('mediaServer.showMediaStatistics') }}</a-doption>
+              <a-doption @click="toggleListOption('showConnectionStatus')">{{ registry.preferences.showConnectionStatus ? '✓ ' : '' }}{{ t('mediaServer.showConnectionStatus') }}</a-doption>
+              <a-doption @click="toggleListOption('showWatchTime')">{{ registry.preferences.showWatchTime ? '✓ ' : '' }}{{ t('mediaServer.showWatchTime') }}</a-doption>
+            </template>
           </template>
         </a-dropdown>
       </div>
@@ -74,7 +89,7 @@
                 <h3>{{ server.name }}</h3>
                 <div class="server-name-status">
                   <span
-                    v-if="server.loginStatus === 'success' || server.loginStatus === 'failed'"
+                    v-if="registry.preferences.serverListView === 'grid' || (registry.preferences.showConnectionStatus && (server.loginStatus === 'success' || server.loginStatus === 'failed'))"
                     class="server-login-dot"
                     :class="server.loginStatus"
                   />
@@ -87,7 +102,13 @@
                   <span v-if="registry.currentServer?.id === server.id && registry.preferences.serverListView !== 'grid'" class="current-badge">{{ t('mediaServer.current') }}</span>
                 </div>
               </div>
-              <div class="server-subtitle">{{ server.type }} - {{ normalizeServerHost(server.baseUrl) }}</div>
+              <div v-if="registry.preferences.showAddress" class="server-subtitle">{{ server.type }} - {{ normalizeServerHost(server.baseUrl) }}</div>
+              <div v-if="registry.preferences.serverListView === 'list' && registry.preferences.showMediaStatistics && serverStatistics[server.id]" class="server-subtitle">
+                {{ t('mediaServer.statisticsSummary', { movies: serverStatistics[server.id]?.movieCount ?? 0, series: serverStatistics[server.id]?.seriesCount ?? 0 }) }}
+              </div>
+              <div v-if="registry.preferences.serverListView === 'list' && registry.preferences.showWatchTime" class="server-subtitle">
+                {{ t('mediaServer.watchTime') }}: {{ formatRelativeTime(server.lastPlayedAt) }}
+              </div>
               <div v-if="server.notes" class="server-notes">{{ server.notes }}</div>
             </div>
           </div>
@@ -163,6 +184,7 @@
       </div>
     </div>
 
+    </template>
     <a-modal
       v-model:visible="renameModalVisible"
       :title="t('mediaServer.renameServer')"
@@ -308,11 +330,13 @@
 
 <script setup lang="ts">
 import { Modal } from '@arco-design/web-vue'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import message from '../../utils/message'
 import useMediaServerRegistryStore from '../../store/mediaServerRegistry'
 import useMediaServerNavigationStore from '../../store/mediaServerNavigation'
 import type { MediaServerConfig, MediaServerSortBy, MediaServerType } from '../../types/mediaServer'
+import type { MediaServerHomeStatistics } from '../../types/mediaServerContent'
+import { getMediaServerHomeShell, getMediaServerHomeStatistics } from '../../media-server/contentGateway'
 import type { PlexResource } from '../../types/mediaServerPlex'
 import jellyfinIcon from '../../assets/media-server/jellyfin.svg'
 import embyIcon from '../../assets/media-server/emby.svg'
@@ -323,14 +347,36 @@ import { fetchMediaServerLoginProfile, signInMediaServer } from '../../media-ser
 import { createPlexServerConfigs, signInPlex, verifyPlexServerConfig } from '../../media-server/plexAuth'
 import { t } from '../../i18n'
 
+const props = defineProps<{ formOnly?: boolean; embedded?: boolean; defaultType?: MediaServerType }>()
 const registry = useMediaServerRegistryStore()
+type ListOption = 'showAddress' | 'showMediaStatistics' | 'showConnectionStatus' | 'showWatchTime'
+const serverStatistics = ref<Record<string, MediaServerHomeStatistics>>({})
+const toggleListOption = (option: ListOption) => {
+  registry.preferences[option] = !registry.preferences[option]
+  registry.save()
+}
+watch(() => [registry.preferences.serverListView, registry.preferences.showMediaStatistics, registry.servers.map((server) => server.id).join(',')], () => {
+  if (registry.preferences.serverListView !== 'list' || !registry.preferences.showMediaStatistics) return
+  for (const server of registry.servers) {
+    if (serverStatistics.value[server.id]) continue
+    getMediaServerHomeShell(server).then(async ({ statistics }) => {
+      serverStatistics.value[server.id] = statistics
+      if (server.type !== 'plex') serverStatistics.value[server.id] = await getMediaServerHomeStatistics(server, statistics.libraryCount)
+    }).catch(() => { /* Offline servers have no current media counts. */ })
+  }
+}, { immediate: true })
 const navigation = useMediaServerNavigationStore()
+const emit = defineEmits<{ (event: 'open-server', id: string): void; (event: 'close'): void; (event: 'saved'): void }>()
 const MEDIA_SERVER_ICON_SET_URLS_KEY = 'MediaServer_IconSetUrls'
-const showServerModal = ref(false)
+const showServerModal = ref(!!props.embedded)
 const showPlexResourcesModal = ref(false)
 const editingServer = ref<MediaServerConfig | null>(null)
-const pendingType = ref<MediaServerType>('jellyfin')
+const pendingType = ref<MediaServerType>(props.defaultType || 'jellyfin')
+const pendingPlexName = ref('')
 const submitting = ref(false)
+watch([showServerModal, showPlexResourcesModal, submitting], ([form, resources, busy]) => {
+  if (props.embedded && !form && !resources && !busy) emit('close')
+})
 const renameModalVisible = ref(false)
 const renameServerId = ref('')
 const renameServerName = ref('')
@@ -448,7 +494,7 @@ const handleAddServer = () => {
 }
 
 const handleQuickAdd = (type: MediaServerType) => {
-  if (type === 'plex') {
+  if (type === 'plex' && !props.embedded) {
     void handlePlexSignIn()
     return
   }
@@ -460,6 +506,7 @@ const handleQuickAdd = (type: MediaServerType) => {
 const handleUseServer = (id: string) => {
   registry.setCurrentServer(id)
   navigation.goHome()
+  emit('open-server', id)
 }
 
 const handleEditServer = (id: string) => {
@@ -482,6 +529,11 @@ const handleDeleteServer = (id: string) => {
       message.success(t('mediaServer.serverDeleted'))
     }
   })
+}
+
+const handleRemoveFromEditor = (id: string) => {
+  showServerModal.value = false
+  handleDeleteServer(id)
 }
 
 const isServerPinned = (id: string) => {
@@ -696,6 +748,7 @@ const runBackgroundServerLogin = async (serverId: string, payload: {
   username?: string
   password?: string
   useHttps?: boolean
+  libraryMode?: boolean
   syncFlag?: boolean
   backupAddresses?: Record<string, string>
   nameCustomized?: boolean
@@ -747,7 +800,8 @@ const handleConfirmPlexResources = async (resources: PlexResource[]) => {
         const serverName = await verifyPlexServerConfig(server)
         const saved = registry.addServer({
           ...server,
-          name: server.nameCustomized ? server.name : (serverName || server.name),
+          name: pendingPlexName.value || (server.nameCustomized ? server.name : (serverName || server.name)),
+          nameCustomized: !!pendingPlexName.value || server.nameCustomized,
           loginStatus: 'success',
           lastLoginCheckedAt: Date.now()
         })
@@ -762,12 +816,14 @@ const handleConfirmPlexResources = async (resources: PlexResource[]) => {
       message.error(t('mediaServer.selectedPlexUnavailable'))
       return
     }
-    if (firstServerId) {
+    if (firstServerId && !props.embedded) {
       registry.setCurrentServer(firstServerId)
       navigation.goHome()
+      emit('open-server', firstServerId)
     }
     showPlexResourcesModal.value = false
     plexResources.value = []
+    emit('saved')
     message.success(failedCount > 0 ? t('mediaServer.plexServersAddedPartial', { saved: savedCount, failed: failedCount }) : t('mediaServer.plexServersAdded', { saved: savedCount }))
   } catch (error: any) {
     console.error('保存 Plex 服务器失败:', error)
@@ -788,6 +844,7 @@ const handleSubmitServer = async (payload: {
   username?: string
   password?: string
   useHttps?: boolean
+  libraryMode?: boolean
   syncFlag?: boolean
   backupAddresses?: Record<string, string>
   nameCustomized?: boolean
@@ -795,6 +852,7 @@ const handleSubmitServer = async (payload: {
   try {
     submitting.value = true
     if (payload.type === 'plex' && !editingServer.value) {
+      pendingPlexName.value = payload.nameCustomized ? payload.name : ''
       showServerModal.value = false
       await handlePlexSignIn()
       return
@@ -844,6 +902,7 @@ const handleSubmitServer = async (payload: {
 
     showServerModal.value = false
     editingServer.value = null
+    emit('saved')
 
     if (savedServer && shouldVerifyInBackground) {
       void runBackgroundServerLogin(savedServer.id, payload)
@@ -855,9 +914,11 @@ const handleSubmitServer = async (payload: {
     submitting.value = false
   }
 }
+defineExpose({ openAddServer: handleAddServer, openProvider: handleQuickAdd, editServer: handleEditServer, deleteServer: handleDeleteServer, openIconManager })
 </script>
 
 <style scoped>
+.source-pending{display:flex;flex:1;align-items:center;justify-content:center;flex-direction:column;gap:16px;padding:32px;color:var(--color-text-2)}
 .media-server-registry-panel {
   height: 100%;
   overflow: auto;
@@ -1189,9 +1250,9 @@ const handleSubmitServer = async (payload: {
   padding: 7px;
   border-radius: 18px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(18, 22, 30, 0.94);
+  background: var(--app-overlay-bg);
   box-shadow: 0 22px 48px rgba(35, 28, 21, 0.18);
-  backdrop-filter: blur(22px) saturate(145%);
+  backdrop-filter: none;
 }
 
 .server-context-item {
@@ -1590,7 +1651,7 @@ const handleSubmitServer = async (payload: {
 }
 
 [arco-theme='dark'] .server-context-menu {
-  background: rgba(24, 28, 36, 0.9);
+  background: var(--app-overlay-bg);
   border-color: rgba(255, 255, 255, 0.1);
   box-shadow: 0 22px 48px rgba(0, 0, 0, 0.36);
 }

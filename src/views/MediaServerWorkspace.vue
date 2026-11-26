@@ -1,5 +1,6 @@
 <template>
-  <div class="media-server-workspace">
+  <div class="media-server-workspace" :class="{ 'unified-server-category': props.unifiedBrowse, 'unified-server-root': props.unifiedRoot }">
+    <MediaServerPlaylistModal />
     <MediaServerRegistryPanel v-if="currentRoute.kind === 'registry'" />
 
     <div v-else-if="!registry.currentServer" class="server-empty-shell">
@@ -158,7 +159,7 @@
         <template v-if="currentRoute.kind === 'home'">
           <div class="home-page">
             <div v-if="content.loadingHome" class="workspace-center-progress">
-              <a-spin size="large" />
+              <MediaLoadingIndicator />
             </div>
 
             <div v-else-if="content.homeError" class="home-error">
@@ -243,7 +244,7 @@
 
         <template v-else-if="currentRoute.kind === 'search'">
           <div class="search-shell search-shell-media-server">
-            <div class="listing-page-header">
+            <div v-if="!props.unifiedBrowse && !props.unifiedRoot" class="listing-page-header">
               <button type="button" class="detail-back-button listing-back-button" @click="navigation.goHome()">
                 <IconFont name="iconarrow-left-2-icon" />
                 <span>{{ currentPageTitle }}</span>
@@ -260,7 +261,7 @@
             />
 
             <div v-if="normalizedSearchQuery && content.loadingSearch" class="home-loading search-feedback-card">
-              <a-spin size="large" />
+              <MediaLoadingIndicator />
               <span>{{ t('mediaServer.searchingFor', { query: normalizedSearchQuery }) }}</span>
             </div>
 
@@ -314,7 +315,7 @@
 
             <template v-else>
               <div v-if="content.loadingSearchSuggestions" class="home-loading search-feedback-card">
-                <a-spin size="large" />
+                <MediaLoadingIndicator />
                 <span>{{ t('mediaServer.loadingRecommendations') }}</span>
               </div>
               <div v-else-if="content.searchSuggestionsError" class="home-error search-feedback-card">
@@ -340,7 +341,7 @@
 
         <template v-else-if="currentRoute.kind === 'library-root' || currentRoute.kind === 'library-page' || currentRoute.kind === 'genre-page' || currentRoute.kind === 'studio-page'">
           <div class="home-page">
-            <div class="listing-page-header">
+            <div v-if="!props.unifiedBrowse && !props.unifiedRoot" class="listing-page-header">
               <button type="button" class="detail-back-button listing-back-button" @click="navigation.goHome()">
                 <IconFont name="iconarrow-left-2-icon" />
                 <span>{{ currentPageTitle }}</span>
@@ -363,7 +364,7 @@
             </div>
 
             <div v-if="showInitialLibraryLoading" class="workspace-center-progress">
-              <a-spin size="large" />
+              <MediaLoadingIndicator />
             </div>
 
             <div v-else-if="currentLibraryError && currentLibraryItems.length === 0" class="home-error">
@@ -373,12 +374,14 @@
 
             <template v-else>
               <div class="library-shell" :class="listingShellClass">
-                <button
-                  v-for="item in currentLibraryItems"
-                  :key="item.id"
+                <a-trigger v-for="item in currentLibraryItems" :key="item.id" trigger="contextMenu" align-point auto-fit-position>
+<div role="button" tabindex="0"
+
+
                   class="library-card interactive"
                   :class="[listingCardClass, { 'library-card-hero': currentRoute.kind === 'library-root' }]"
-                  @click="handleLibraryItemClick(item.id, item.title, item)"
+                  @click="props.unifiedRoot && props.rootSelection ? toggleRootLibrary(item.id) : handleLibraryItemClick(item.id, item.title, item)"
+                  @contextmenu.prevent="openLibraryCategoryMenu($event, item)"
                 >
                   <div
                     class="library-cover media-image-frame"
@@ -395,12 +398,17 @@
                       @load="handleCardImageLoad"
                       @error="handleCardImageError"
                     />
-                    <div class="media-card-placeholder media-image-placeholder">{{ item.title.slice(0, 1) }}</div>
-                    <div v-if="currentRoute.kind === 'library-root'" class="library-cover-overlay"></div>
-                    <div v-if="currentRoute.kind === 'library-root'" class="library-cover-title">{{ getListingHeading(item) }}</div>
+                    <div v-if="props.unifiedRoot && !pickLibraryListingImage(item)" class="root-library-fallback"><Folder :size="56" aria-hidden="true" /></div>
+                    <div v-else class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
+                    <div v-if="props.unifiedRoot && props.rootSelection" class="root-library-check"><input type="checkbox" :checked="selectedRootLibraries.includes(item.id)" tabindex="-1" :aria-label="item.title" /></div>
+                    <div v-if="currentRoute.kind === 'library-root' && !props.unifiedRoot" class="library-cover-overlay"></div>
+                    <div v-if="currentRoute.kind === 'library-root' && !props.unifiedRoot" class="library-cover-title">{{ getListingHeading(item) }}</div>
+                    <WatchedIndicator v-if="isDetailCandidate(item)" corner :watched="item.isPlayed === true" />
+                    <PosterRatingBadge :rating="item.rating" :is-movie="item.kind === 'movie'" />
                     <div v-if="getListingOverlay(item)" class="listing-overlay-badge">{{ getListingOverlay(item) }}</div>
                   </div>
-                  <template v-if="currentRoute.kind !== 'library-root' && currentListingBrowseMode === 'grid'">
+                  <h4 v-if="props.unifiedRoot">{{ getListingHeading(item) }}</h4>
+                  <template v-else-if="currentRoute.kind !== 'library-root' && currentListingBrowseMode === 'grid'">
                     <h4>{{ getListingHeading(item) }}</h4>
                     <div class="library-meta-line">{{ getListingYearLabel(item) }}</div>
                   </template>
@@ -423,13 +431,18 @@
                       <p class="library-list-overview" :class="{ 'is-empty': !getListingOverview(item) }">
                         {{ getListingOverview(item) || t('mediaServer.noOverview') }}
                       </p>
+                      <WatchedIndicator v-if="isDetailCandidate(item)" :watched="item.isPlayed === true" :disabled="watchedPending.has(item.id)" @toggle="handleHomeMediaAction(item, 'watched')" />
+                      <div v-if="item.genres?.length" class="library-list-genres"><span v-for="genre in item.genres" :key="genre">{{ genre }}</span></div>
                     </div>
+                    <button v-if="item.kind !== 'series' && item.kind !== 'season' && isDetailCandidate(item)" type="button" class="server-file-download" :aria-label="t('mediaServer.download')" @click.stop="handleHomeMediaAction(item, 'download')" @keydown.enter.stop><Download :size="22" /></button>
                   </template>
-                </button>
+                </div>
+<template #content><MediaPosterMenu v-if="isDetailCandidate(item)" server :tv="item.kind === 'series' || item.kind === 'season'" :watched="item.isPlayed" :favorite="item.isFavorite" :disabled="item.kind === 'season' ? ['rating', 'playlist'] : ['playlist']" @action="handleServerPosterAction(item, $event)" /></template>
+</a-trigger>
               </div>
-              <div v-if="currentLibraryItems.length === 0" class="empty-placeholder">{{ t('mediaServer.emptyLibrary') }}</div>
+              <MediaEmptyFolder v-if="currentLibraryItems.length === 0" class="server-empty-folder" />
               <div v-else-if="(currentRoute.kind === 'library-page' || currentRoute.kind === 'genre-page' || currentRoute.kind === 'studio-page') && currentLibraryPageLoading" class="home-loading collection-loading-inline">
-                <a-spin />
+                <MediaLoadingIndicator />
                 <span>{{ t('mediaServer.loadingMore') }}</span>
               </div>
               <div v-else-if="(currentRoute.kind === 'library-page' || currentRoute.kind === 'genre-page' || currentRoute.kind === 'studio-page') && currentLibraryError" class="home-error inline-home-error">
@@ -442,8 +455,8 @@
         </template>
 
         <template v-else-if="currentRoute.kind === 'collection-page'">
-          <div class="home-page">
-            <div class="listing-page-header">
+          <div class="home-page" :class="{ 'collection-page-initial-loading': currentCollectionLoading && currentCollectionItems.length === 0 }">
+            <div v-if="!props.unifiedBrowse && !props.unifiedRoot" class="listing-page-header">
               <button type="button" class="detail-back-button listing-back-button" @click="navigation.goHome()">
                 <IconFont name="iconarrow-left-2-icon" />
                 <span>{{ currentPageTitle }}</span>
@@ -464,13 +477,13 @@
                 </button>
               </div>
             </div>
-            <div class="home-intro listing-intro listing-intro-description">
-              <p>这里展示首页卡片对应的完整列表，行为和 macOS 里的“查看全部”一致，并支持滚动分页加载。</p>
+            <div v-if="currentCollectionLoading && currentCollectionItems.length === 0" class="workspace-center-progress collection-initial-loading">
+              <MediaLoadingIndicator />
             </div>
+            <div v-else class="library-shell" :class="listingShellClass">
+              <a-trigger v-for="item in currentCollectionItems" :key="item.id" trigger="contextMenu" align-point auto-fit-position>
+<div role="button" tabindex="0"
 
-            <div class="library-shell" :class="listingShellClass">
-              <button
-                v-for="item in currentCollectionItems"
                 :key="`collection-${item.id}`"
                 class="library-card interactive"
                 :class="listingCardClass"
@@ -491,8 +504,10 @@
                     @load="handleCardImageLoad"
                     @error="handleCardImageError"
                   />
-                  <div class="media-card-placeholder media-image-placeholder">{{ item.title.slice(0, 1) }}</div>
-                  <div v-if="getListingOverlay(item)" class="listing-overlay-badge">{{ getListingOverlay(item) }}</div>
+                  <div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
+                  <WatchedIndicator v-if="isDetailCandidate(item)" corner :watched="item.isPlayed === true" />
+                  <PosterRatingBadge :rating="item.rating" :is-movie="item.kind === 'movie'" />
+                    <div v-if="getListingOverlay(item)" class="listing-overlay-badge">{{ getListingOverlay(item) }}</div>
                 </div>
                 <template v-if="currentListingBrowseMode === 'grid'">
                   <h4>{{ getListingHeading(item) }}</h4>
@@ -517,17 +532,22 @@
                     <p class="library-list-overview" :class="{ 'is-empty': !getListingOverview(item) }">
                       {{ getListingOverview(item) || t('mediaServer.noOverview') }}
                     </p>
+                      <WatchedIndicator v-if="isDetailCandidate(item)" :watched="item.isPlayed === true" :disabled="watchedPending.has(item.id)" @toggle="handleHomeMediaAction(item, 'watched')" />
+                      <div v-if="item.genres?.length" class="library-list-genres"><span v-for="genre in item.genres" :key="genre">{{ genre }}</span></div>
                   </div>
+                  <button v-if="item.kind !== 'series' && item.kind !== 'season' && isDetailCandidate(item)" type="button" class="server-file-download" :aria-label="t('mediaServer.download')" @click.stop="handleHomeMediaAction(item, 'download')" @keydown.enter.stop><Download :size="22" /></button>
                 </template>
-              </button>
+              </div>
+<template #content><MediaPosterMenu v-if="isDetailCandidate(item)" server :tv="item.kind === 'series' || item.kind === 'season'" :watched="item.isPlayed" :favorite="item.isFavorite" :disabled="item.kind === 'season' ? ['transcode', 'rating', 'share', 'playlist'] : ['transcode', 'share', 'playlist']" @action="handleServerPosterAction(item, $event)" /></template>
+</a-trigger>
             </div>
             <div v-if="currentCollectionError && currentCollectionItems.length === 0" class="home-error inline-home-error">
               <div class="home-error-text">{{ currentCollectionError }}</div>
               <a-button type="primary" @click="loadCurrentCollection(true)">{{ t('mediaServer.retry') }}</a-button>
             </div>
-            <div v-else-if="currentCollectionItems.length === 0" class="empty-placeholder">{{ t('mediaServer.emptyLibrary') }}</div>
-            <div v-else-if="currentCollectionLoading" class="home-loading collection-loading-inline">
-              <a-spin />
+            <MediaEmptyFolder v-else-if="currentCollectionItems.length === 0 && !currentCollectionLoading" class="server-empty-folder" />
+            <div v-else-if="currentCollectionLoading && currentCollectionItems.length > 0" class="home-loading collection-loading-inline">
+              <MediaLoadingIndicator :size="32" />
               <span>{{ t('mediaServer.loadingMore') }}</span>
             </div>
             <div v-else-if="currentCollectionError" class="home-error inline-home-error">
@@ -541,9 +561,7 @@
         <template v-else-if="currentRoute.kind === 'item-detail' || currentRoute.kind === 'person-page'">
           <div class="detail-page">
             <div v-if="showDetailLoadingState" class="detail-loading-state">
-              <div class="detail-loading-indicator">
-                <a-spin size="large" />
-              </div>
+              <MediaLoadingIndicator />
             </div>
 
             <div v-else-if="showDetailErrorState" class="home-error">
@@ -554,7 +572,7 @@
               <div class="person-shell">
                 <div class="person-hero">
                   <img
-                    v-if="personBackdropUrl"
+                    v-if="personBackdropUrl && !detailBackdropLoadFailed"
                     class="person-hero-backdrop"
                     :src="personBackdropUrl"
                     :alt="currentDetail.title"
@@ -583,7 +601,7 @@
                           @load="handleCardImageLoad"
                           @error="handleCardImageError"
                         />
-                        <div class="media-card-placeholder media-image-placeholder">{{ currentDetail.title.slice(0, 1) }}</div>
+                        <div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
                       </div>
 
                       <div class="person-shelf-card">
@@ -658,7 +676,7 @@
                             @load="handleCardImageLoad"
                             @error="handleCardImageError"
                           />
-                          <div class="media-card-placeholder media-image-placeholder">{{ item.title.slice(0, 1) }}</div>
+                          <div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
                         </div>
                         <div class="person-rail-kicker">{{ item.parentTitle || section.title }}</div>
                         <div class="person-rail-title person-rail-title-episode">{{ detailEpisodeTitle(item) }}</div>
@@ -681,8 +699,9 @@
                             @load="handleCardImageLoad"
                             @error="handleCardImageError"
                           />
-                          <div class="media-card-placeholder media-image-placeholder">{{ item.title.slice(0, 1) }}</div>
+                          <div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
                           <div v-if="getListingOverlay(item)" class="person-poster-overlay">{{ getListingOverlay(item) }}</div>
+                          <PosterRatingBadge :rating="item.rating" :is-movie="item.kind === 'movie'" />
                         </div>
                         <div class="person-rail-title">{{ item.title }}</div>
                         <div v-if="getListingSubtitle(item)" class="person-rail-subtitle">{{ getListingSubtitle(item) }}</div>
@@ -743,7 +762,7 @@
                             @load="handleCardImageLoad"
                             @error="handleCardImageError"
                           />
-                          <div class="media-card-placeholder media-image-placeholder">{{ item.title.slice(0, 1) }}</div>
+                          <div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
                         </div>
                         <div class="person-rail-title">{{ item.title }}</div>
                       </button>
@@ -773,7 +792,7 @@
             <template v-else-if="currentDetail">
               <div class="detail-shell">
                 <img
-                  v-if="detailBackdropUrl"
+                  v-if="detailBackdropUrl && !detailBackdropLoadFailed"
                   class="detail-page-backdrop"
                   :src="detailBackdropUrl"
                   :alt="currentDetail.title"
@@ -782,7 +801,7 @@
                 <div class="detail-page-tint" aria-hidden="true" />
                 <div class="detail-backdrop-stage">
                   <img
-                    v-if="detailBackdropUrl"
+                    v-if="detailBackdropUrl && !detailBackdropLoadFailed"
                     class="detail-backdrop-image"
                     :src="detailBackdropUrl"
                     :alt="currentDetail.title"
@@ -795,53 +814,136 @@
                   <div class="detail-top-back">
                     <button type="button" class="detail-back-button" @click="handleBack">
                       <IconFont name="iconarrow-left-2-icon" />
-                      <span class="back-button-server-icon">
-                        <img :src="serverDisplayIcon(registry.currentServer)" :alt="registry.currentServer?.name || 'server'" @error="handleCurrentServerIconError" />
-                      </span>
                       <span>{{ currentBackLabel }}</span>
                     </button>
+                    <div class="detail-top-actions">
+                      <button type="button" class="detail-top-icon-action" title="播放列表" @click="handleServerPosterAction(detailDisplayedItem, 'playlist')"><ListPlus :size="20" /></button>
+                      <a-dropdown trigger="click" position="br">
+                        <button type="button" class="detail-top-icon-action" title="更多操作"><Ellipsis :size="20" /><ChevronDown :size="12" /></button>
+                        <template #content><MediaPosterMenu server detail :tv="currentDetail.kind === 'series' || currentDetail.kind === 'season'" :watched="detailIsWatched" :favorite="detailIsFavorite" @action="handleServerPosterAction(detailDisplayedItem, $event)" /></template>
+                      </a-dropdown>
+                    </div>
                   </div>
 
                   <div class="detail-hero-copy">
                     <div class="detail-overlay-grid">
-                      <div class="detail-hero-poster media-image-frame" :class="{ 'has-image': !!detailHeroPosterImage }">
-                        <img
-                          v-if="detailHeroPosterImage"
-                          :src="detailHeroPosterImage"
-                          :alt="currentDetail.title || detailDisplayedItem.title"
-                          @load="handleCardImageLoad"
-                          @error="handleCardImageError"
-                        />
-                        <div class="media-card-placeholder media-image-placeholder">{{ (currentDetail.title || detailDisplayedItem.title).slice(0, 1) }}</div>
-                      </div>
-
-                      <div class="detail-hero-main">
-                        <div class="detail-title-block">
+                      <div class="detail-hero-controls">
+                        <div v-if="detailLogoUrl" class="detail-title-block detail-title-block-brand">
                           <img
-                            v-if="detailLogoUrl"
                             class="detail-hero-logo"
                             :src="detailLogoUrl"
                             :alt="currentDetail.title"
                             @error="handleDetailLogoError"
                           />
-                          <div v-else class="detail-hero-title">{{ currentDetail.title }}</div>
+                        </div>
+                        <div v-else class="detail-title-block">
+                          <h1 class="detail-hero-title">{{ currentDetail.title }}</h1>
                         </div>
 
+                        <div class="detail-actions-column">
+                          <div class="detail-play-row" :class="{ 'has-version': detailSourceOptions.length > 1 }">
+                            <button class="detail-primary-play" :class="{ 'has-resume': detailPlayResume }" @click="handleDetailPlay">
+                              <span v-if="detailPlayResume" class="detail-play-progress" aria-hidden="true" :style="{ width: `${detailPlayResume.percent}%` }"></span>
+                              <span class="detail-play-label">{{ detailPlayLabel }}</span>
+                            </button>
+                            <a-trigger
+                              v-if="detailSourceOptions.length > 1"
+                              v-model:popup-visible="versionMenuVisible"
+                              trigger="click"
+                              position="bottom"
+                              :auto-fit-popup-width="false"
+                              :unmount-on-close="false"
+                            >
+                              <button class="detail-play-version-trigger" title="选择视频版本">
+                                <IconFont name="icondown" />
+                              </button>
+                              <template #content>
+                                <div class="detail-version-menu">
+                                  <button
+                                    v-for="source in detailSourceOptions"
+                                    :key="source.id"
+                                    type="button"
+                                    class="detail-version-option"
+                                    :class="{ active: selectedSourceOption?.id === source.id }"
+                                    @click="selectSourceOption(source.id)"
+                                  >
+                                    <div class="detail-version-main">
+                                      <span>{{ mediaVersionQualityTitle(source.mediaInfoCards) || source.title }}</span>
+                                      <small v-if="mediaVersionQualityDetails(source.mediaInfoCards)">{{ mediaVersionQualityDetails(source.mediaInfoCards) }}</small>
+                                    </div>
+                                    <span v-if="selectedSourceOption?.id === source.id" class="detail-version-check">{{ t('mediaServer.current') }}</span>
+                                  </button>
+                                </div>
+                              </template>
+                            </a-trigger>
+                          </div>
+                          <div class="detail-icon-actions">
+                            <button
+                              class="detail-square-action"
+                              :class="{ active: detailIsWatched }"
+                              :title="detailIsWatched ? '标记未观看' : '标记已观看'"
+                              @click="handleDetailAction('watched')"
+                            >
+                              <component :is="detailIsWatched ? EyeOff : Eye" :size="20" />
+                            </button>
+                            <a-trigger
+                              v-if="detailDownloadOptions.length > 1"
+                              trigger="click"
+                              position="bottom"
+                              :auto-fit-popup-width="false"
+                            >
+                              <button class="detail-square-action" title="下载">
+                                <IconFont name="icondownload" />
+                              </button>
+                              <template #content>
+                                <div class="detail-version-menu">
+                                  <button
+                                    v-for="option in detailDownloadOptions"
+                                    :key="option.key"
+                                    type="button"
+                                    class="detail-version-option"
+                                    @click="handleDetailDownload(option.key)"
+                                  >
+                                    <div class="detail-version-main">
+                                      <span>{{ option.label }}</span>
+                                      <small v-if="option.description">{{ option.description }}</small>
+                                    </div>
+                                  </button>
+                                </div>
+                              </template>
+                            </a-trigger>
+                            <button v-else class="detail-square-action" title="下载" @click="handleDetailDownload('current')">
+                              <IconFont name="icondownload" />
+                            </button>
+                            <button
+                              class="detail-square-action"
+                              title="评分"
+                              @click="openServerPersonalRating(detailDisplayedItem)"
+                            ><Star :size="20" /></button>
+                            <button
+                              class="detail-square-action"
+                              :class="{ active: detailIsFavorite }"
+                              :title="detailIsFavorite ? '取消收藏' : '收藏'"
+                              @click="handleDetailAction('favorite')"
+                            >
+                              <Heart :size="20" :fill="detailIsFavorite ? 'currentColor' : 'none'" />
+                            </button>
+                            <button class="detail-square-action" title="播放列表" @click="handleServerPosterAction(detailDisplayedItem, 'playlist')"><ListPlus :size="20" /></button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="detail-hero-main">
                         <div class="detail-synopsis-column">
-                          <div v-if="detailEpisodeHeading" class="detail-episode-heading">{{ detailEpisodeHeading }}</div>
-                          <div class="detail-rating-line">
-                            <span v-if="typeof detailDisplayedItem.rating === 'number'" class="detail-star-rating">
-                              ★ {{ detailDisplayedItem.rating.toFixed(1) }}
-                            </span>
+                          <div class="detail-episode-heading">
+                            <span v-if="detailEpisodeHeading">{{ detailEpisodeHeading }} · </span>{{ detailDisplayedItem.title || currentDetail.title }}
+                          </div>
+                          <div class="detail-facts-line">
+                            <span v-if="detailTechnicalLine">{{ detailTechnicalLine }}</span>
+                            <span v-for="badge in detailMetaBadges" :key="badge" class="detail-meta-badge">{{ badge }}</span>
                             <span v-if="detailGenreLine">{{ detailGenreLine }}</span>
                           </div>
-                          <div class="detail-tech-line">
-                            {{ detailTechnicalLine }}
-                          </div>
-                          <div v-if="detailMetaBadges.length > 0" class="detail-meta-badges">
-                            <span v-for="badge in detailMetaBadges" :key="badge" class="detail-meta-badge">{{ badge }}</span>
-                          </div>
-                          <div class="detail-overview-block" :class="{ 'is-empty': !currentOverviewText }">
+                          <div v-if="!generalPreferences.hideSpoilers" class="detail-overview-block" :class="{ 'is-empty': !currentOverviewText }">
                             <p
                               class="detail-overview"
                               :class="{ 'is-empty': !currentOverviewText }"
@@ -850,94 +952,12 @@
                               {{ currentOverviewText || t('mediaServer.noOverview') }}
                             </p>
                           </div>
-                        </div>
-
-                        <div class="detail-actions-column">
-                          <div class="detail-icon-actions">
-                            <button
-                              class="detail-square-action"
-                              :class="{ active: detailIsWatched }"
-                              @click="handleDetailAction('watched')"
-                            >
-                              <span class="detail-square-glyph">✓</span>
-                            </button>
-                            <button
-                              class="detail-square-action"
-                              :class="{ active: detailIsFavorite }"
-                              @click="handleDetailAction('favorite')"
-                            >
-                              <span class="detail-square-glyph">{{ detailIsFavorite ? '♥' : '♡' }}</span>
-                            </button>
-                            <a-trigger
-                              v-if="detailSourceOptions.length > 0"
-                              v-model:popup-visible="versionMenuVisible"
-                              trigger="click"
-                              position="bottom"
-                              auto-fit-popup-width="false"
-                              :unmount-on-close="false"
-                            >
-                              <button class="detail-square-action detail-square-action-version">
-                                <span class="detail-square-glyph">⋯</span>
-                              </button>
-                              <template #content>
-                                <div class="detail-version-menu">
-                                  <button
-                                  v-for="source in detailSourceOptions"
-                                  :key="source.id"
-                                  type="button"
-                                  class="detail-version-option"
-                                  :class="{ active: selectedSourceOption?.id === source.id }"
-                                  @click="selectSourceOption(source.id); versionMenuVisible = false"
-                                >
-                                  <div class="detail-version-main">
-                                    <span>{{ source.title }}</span>
-                                    <small v-if="source.fileSubLabel">{{ source.fileSubLabel }}</small>
-                                  </div>
-                                  <span v-if="selectedSourceOption?.id === source.id" class="detail-version-check">{{ t('mediaServer.current') }}</span>
-                                </button>
-                                </div>
-                              </template>
-                            </a-trigger>
-                            <button v-else class="detail-square-action detail-square-action-version" disabled>
-                              <span class="detail-square-glyph">⋯</span>
-                            </button>
-                          </div>
-
-                          <button class="detail-primary-play" @click="handleDetailPlay">
-                            <span class="detail-play-glyph">▶</span>
-                            <span class="detail-play-label">{{ detailPlayLabel }}</span>
-                          </button>
-                          <a-trigger
-                            v-if="detailDownloadOptions.length > 1"
-                            trigger="click"
-                            position="bottom"
-                            auto-fit-popup-width="false"
-                          >
-                            <button class="detail-secondary-download">
-                              <span class="detail-play-glyph">↓</span>
-                              <span class="detail-play-label">{{ t('mediaServer.download') }}</span>
-                            </button>
-                            <template #content>
-                              <div class="detail-version-menu">
-                                <button
-                                  v-for="option in detailDownloadOptions"
-                                  :key="option.key"
-                                  type="button"
-                                  class="detail-version-option"
-                                  @click="handleDetailDownload(option.key)"
-                                >
-                                  <div class="detail-version-main">
-                                    <span>{{ option.label }}</span>
-                                    <small v-if="option.description">{{ option.description }}</small>
-                                  </div>
-                                </button>
-                              </div>
-                            </template>
-                          </a-trigger>
-                          <button v-else class="detail-secondary-download" @click="handleDetailDownload('current')">
-                            <span class="detail-play-glyph">↓</span>
-                            <span class="detail-play-label">{{ t('mediaServer.download') }}</span>
-                          </button>
+                          <MediaSourceRatings
+                            class="detail-score-row"
+                            :is-movie="currentDetail?.kind === 'movie'"
+                            :rating="detailDisplayedItem.rating"
+                            :critic-rating="detailDisplayedItem.criticRating"
+                          />
                         </div>
                       </div>
                     </div>
@@ -945,14 +965,14 @@
                 </div>
 
                 <div class="detail-lower-content">
+                  <CustomSeriesDetailRail v-if="activeCustomSeries" :series="activeCustomSeries"
+                    :selected-id="currentRoute.kind === 'item-detail' ? currentRoute.itemId : undefined"
+                    :selected-server-id="registry.currentServer?.id"
+                    @open="emit('openCustomSeriesMember', $event)" />
                   <section
                     v-if="detailSeasonMenu.length > 0 || detailEpisodeItems.length > 0"
                     class="detail-section detail-section-episodes"
                   >
-                    <div class="detail-section-header">
-                      <h4>{{ detailSeasonTitle }}</h4>
-                    </div>
-
                     <div v-if="detailSeasonMenu.length > 1" class="detail-season-picker">
                       <button
                         v-for="season in detailSeasonMenu"
@@ -966,12 +986,16 @@
                     </div>
 
                     <div class="detail-episodes-rail">
-                      <button
-                        v-for="episode in detailEpisodeItems"
+                      <div
+                        v-for="(episode, episodeIndex) in detailEpisodeItems"
                         :key="episode.id"
                         class="detail-episode-card"
                         :class="{ selected: selectedEpisodeId === episode.id }"
+                        role="button"
+                        tabindex="0"
                         @click="selectDetailEpisode(episode.id)"
+                        @keydown.enter.self="selectDetailEpisode(episode.id)"
+                        @keydown.space.self.prevent="selectDetailEpisode(episode.id)"
                       >
                         <div class="detail-episode-cover media-image-frame" :class="{ 'has-image': !!pickDetailEpisodeCardImage(episode) }">
                           <img
@@ -981,22 +1005,26 @@
                             @load="handleCardImageLoad"
                             @error="handleCardImageError"
                           />
-                          <div class="media-card-placeholder media-image-placeholder">{{ episode.title.slice(0, 1) }}</div>
-                          <div v-if="selectedEpisodeId === episode.id" class="detail-episode-selected-badge">
-                            <span>✓</span>
-                          </div>
+                          <WatchedIndicator corner :watched="episode.isPlayed === true" /><div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder kind="resume" /></div>
+                          <PosterRatingBadge :rating="episode.rating" />
+                          <button type="button" class="detail-episode-play-overlay" :aria-label="`播放 ${episode.title}`" @click.stop="playHomeMediaItem(episode)">
+                            <Play :size="20" fill="currentColor" aria-hidden="true" />
+                          </button>
                           <div v-if="typeof episode.progress === 'number' && episode.progress > 0" class="detail-episode-progress">
                             <div class="detail-episode-progress-bar" :style="{ width: `${Math.min(100, episode.progress)}%` }" />
                           </div>
                         </div>
-                        <div class="detail-episode-kicker">{{ detailEpisodeLocator(episode) }}</div>
-                        <div class="detail-episode-title">{{ detailEpisodeTitle(episode) }}</div>
-                      </button>
+                        <div class="detail-episode-caption">
+                          <span class="detail-episode-index">{{ episodeIndex + 1 }}.</span>
+                          <span class="detail-episode-kicker">{{ detailEpisodeLocator(episode) }}</span>
+                          <span class="detail-episode-title">{{ detailEpisodeTitle(episode) }}</span>
+                        </div>
+                      </div>
                     </div>
 
                   </section>
 
-                  <section v-if="detailGenres.length > 0" class="detail-section">
+                  <section v-if="detailGenres.length > 0" class="detail-section detail-section-genres">
                     <div class="detail-section-header">
                       <h4>类型</h4>
                     </div>
@@ -1012,7 +1040,7 @@
                     </div>
                   </section>
 
-                  <section v-if="detailStudios.length > 0" class="detail-section">
+                  <section v-if="detailStudios.length > 0" class="detail-section detail-section-studios">
                     <div class="detail-section-header">
                       <h4>工作室</h4>
                     </div>
@@ -1028,9 +1056,9 @@
                     </div>
                   </section>
 
-                  <section v-if="detailPeople.length > 0" class="detail-section">
+                  <section v-if="detailPeople.length > 0" class="detail-section detail-section-people">
                     <div class="detail-section-header">
-                      <h4>演员与工作人员</h4>
+                      <h4>演职员</h4>
                     </div>
                     <div class="people-rail detail-people-rail">
                       <button
@@ -1047,7 +1075,7 @@
                             @load="handleCardImageLoad"
                             @error="handleCardImageError"
                           />
-                          <div class="person-placeholder media-image-placeholder">{{ person.name.slice(0, 1) }}</div>
+                          <div class="person-placeholder media-image-placeholder"><UserRound class="person-placeholder-icon" aria-hidden="true" :stroke-width="1.5" /></div>
                         </div>
                         <div class="person-name">{{ person.name }}</div>
                         <div class="person-role">{{ person.role || '—' }}</div>
@@ -1055,7 +1083,7 @@
                     </div>
                   </section>
 
-                  <section v-if="detailSimilarLoading || detailSimilarItems.length > 0 || detailSimilarError" class="detail-section">
+                  <section v-if="detailSimilarLoading || detailSimilarItems.length > 0 || detailSimilarError" class="detail-section detail-section-similar">
                     <div class="detail-section-header">
                       <h4>推荐</h4>
                     </div>
@@ -1076,15 +1104,16 @@
                             @load="handleCardImageLoad"
                             @error="handleCardImageError"
                           />
-                          <div class="media-card-placeholder media-image-placeholder">{{ item.title.slice(0, 1) }}</div>
-                          <div v-if="item.childCount" class="detail-recommendation-count">{{ item.childCount }}</div>
+                          <div class="media-card-placeholder media-image-placeholder"><MediaPosterPlaceholder /></div>
+                          <WatchedIndicator v-if="isDetailCandidate(item)" corner :watched="item.isPlayed === true" /><div v-if="item.childCount" class="detail-recommendation-count">{{ item.childCount }}</div>
+                          <PosterRatingBadge :rating="item.rating" :is-movie="item.kind === 'movie'" />
                         </div>
                         <div class="detail-recommendation-title">{{ item.title }}</div>
                       </button>
                     </div>
                   </section>
 
-                  <section v-if="detailDisplayedItem.externalLinks.length > 0" class="detail-section">
+                  <section v-if="detailDisplayedItem.externalLinks.length > 0" class="detail-section detail-section-links">
                     <div class="detail-section-header">
                       <h4>链接</h4>
                     </div>
@@ -1102,10 +1131,19 @@
                     </div>
                   </section>
 
-                  <section v-if="selectedSourceOption?.mediaInfoCards.length || selectedSourceOption?.fileLabel || detailDisplayedItem.mediaInfoCards.length || detailDisplayedItem.fileLabel" class="detail-section">
+                  <section v-if="selectedSourceOption?.mediaInfoCards.length || selectedSourceOption?.fileLabel || selectedSourceOption?.filePath || detailDisplayedItem.mediaInfoCards.length || detailDisplayedItem.fileLabel || detailDisplayedItem.filePath" class="detail-section detail-section-media">
                     <div class="detail-section-header">
                       <h4>媒体</h4>
                     </div>
+                    <div v-if="selectedSourceOption?.fileLabel || selectedSourceOption?.filePath || detailDisplayedItem.fileLabel || detailDisplayedItem.filePath || detailFileSummary" class="detail-file-bar">
+                      <div class="detail-file-source">在 {{ registry.currentServer?.name || '媒体服务器' }} 上</div>
+                      <div v-if="selectedSourceOption?.filePath || detailDisplayedItem.filePath" class="detail-file-path">
+                        路径：{{ selectedSourceOption?.filePath || detailDisplayedItem.filePath }}
+                      </div>
+                      <div class="detail-file-name">{{ selectedSourceOption?.fileLabel || detailDisplayedItem.fileLabel }}</div>
+                      <div v-if="detailFileSummary" class="detail-file-meta">{{ detailFileSummary }}</div>
+                    </div>
+
                     <div class="detail-media-card-rail">
                       <div
                         v-for="card in detailMediaCards"
@@ -1132,10 +1170,6 @@
                       </div>
                     </div>
 
-                    <div v-if="selectedSourceOption?.fileLabel || detailDisplayedItem.fileLabel" class="detail-file-bar">
-                      <div class="detail-file-name">{{ selectedSourceOption?.fileLabel || detailDisplayedItem.fileLabel }}</div>
-                      <div v-if="selectedSourceOption?.fileSubLabel || detailDisplayedItem.fileSubLabel" class="detail-file-meta">{{ selectedSourceOption?.fileSubLabel || detailDisplayedItem.fileSubLabel }}</div>
-                    </div>
                   </section>
                 </div>
               </div>
@@ -1255,7 +1289,7 @@
               <div class="server-icon-set-column">
                 <div class="server-icon-column-heading">{{ t('mediaServer.iconSets') }}</div>
                 <div v-if="serverIconSetsLoading" class="server-icon-empty">
-                  <a-spin size="small" />
+                  <MediaLoadingIndicator :size="24" />
                   <span>{{ t('mediaServer.loadingIconSets') }}</span>
                 </div>
                 <div v-else-if="filteredServerIconSets.length === 0" class="server-icon-empty">
@@ -1366,7 +1400,42 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { generalPreferences, displayScopeAllows } from '../utils/seriesVersionPreferences'
+import MediaPosterPlaceholder from '../components/MediaPosterPlaceholder.vue'
+import MediaLoadingIndicator from '../components/MediaLoadingIndicator.vue'
+import MediaPosterMenu from '../components/MediaPosterMenu.vue'
+import type { PosterAction } from '../utils/mediaPosterMenu'
+import { openCustomSeries } from '../utils/customMediaSeries'
+import type { CustomSeriesDetail, SeriesMedia } from '../utils/customMediaSeries'
+import CustomSeriesDetailRail from '../components/CustomSeriesDetailRail.vue'
+import { detailResumeState } from '../utils/detailResume'
+import MediaEmptyFolder from '../components/MediaEmptyFolder.vue'
+import { Download, Folder, Play, UserRound, Heart, Star, ListPlus, Ellipsis, ChevronDown, Eye, EyeOff } from 'lucide-vue-next'
+import { openMediaShare } from '../utils/mediaShare'
+import { openServerPersonalRating } from '../utils/mediaPersonalRating'
+import MediaServerPlaylistModal from '../components/MediaServerPlaylistModal.vue'
+import { openServerPlaylist } from '../media-server/playlists'
+import WatchedIndicator from '../components/WatchedIndicator.vue'
+import PosterRatingBadge from '../components/PosterRatingBadge.vue'
+import { compareMediaServerItems, type MediaServerBrowseSort, type MediaServerSortDirection } from '../utils/mediaServerBrowseSort'
+const emit = defineEmits<{ openCustomSeriesMember: [member: SeriesMedia]; categoryContext: [event: MouseEvent, route: string]; categoryFavorites: [routes: string[]] }>()
+function openLibraryCategoryMenu(event: MouseEvent, item: MediaServerLibraryNode) {
+  if (currentRoute.value.kind !== 'library-root') return
+  const server = registry.currentServer
+  if (server) emit('categoryContext', event, 'home-entry/' + encodeURIComponent(`${server.id}:${item.id}`))
+}
+const props = defineProps<{ customSeriesDetail?: CustomSeriesDetail; unifiedRoot?: boolean; rootSelection?: boolean; unifiedBrowse?: boolean; browseMode?: 'grid' | 'list'; serverSort?: MediaServerBrowseSort; serverSortDirection?: MediaServerSortDirection; serverSortSeed?: number }>()
+const activeCustomSeries = computed(() => {
+  const route = currentRoute.value
+  return route.kind === 'item-detail' && props.customSeriesDetail?.members.some(member => member.serverId === registry.currentServer?.id && member.id === route.itemId) ? props.customSeriesDetail : undefined
+})
+function sortListing<T extends MediaServerLibraryNode>(items: T[]): T[] {
+  if (!props.unifiedBrowse && !props.unifiedRoot) return items
+  // Paged catalogs keep the provider's global order. Shuffle is a stable local presentation.
+  if (props.unifiedBrowse && props.serverSort !== 'random' && currentCollectionKind.value !== 'nextup') return items
+  return [...items].sort((a, b) => compareMediaServerItems(a, b, props.serverSort || 'sortName', props.serverSortDirection || 'ascending', props.serverSortSeed))
+}
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import MediaServerRegistryPanel from '../components/media-server/MediaServerRegistryPanel.vue'
 import MediaServerPosterRow from '../components/media-server/home/MediaServerPosterRow.vue'
 import MediaServerResumeRow from '../components/media-server/home/MediaServerResumeRow.vue'
@@ -1374,13 +1443,17 @@ import MediaServerStatsRow from '../components/media-server/home/MediaServerStat
 import jellyfinIcon from '../assets/media-server/jellyfin.svg'
 import embyIcon from '../assets/media-server/emby.svg'
 import plexIcon from '../assets/media-server/plex.svg'
+import MediaSourceRatings from '../components/MediaSourceRatings.vue'
 import { getMediaServerDownloadInfo, getMediaServerPlaybackInfo, getMediaServerSimilarItems, updateMediaServerFavoriteState, updateMediaServerPlayedState } from '../media-server/contentGateway'
+import { mediaFileSummary, mediaVersionQualityDetails, mediaVersionQualityTitle } from '../media-server/mediaSummary'
 import { resolveMediaServerImage } from '../media-server/imageSources'
 import { toMsCacheUrl } from '../media-server/imageCache'
 import useMediaServerRegistryStore from '../store/mediaServerRegistry'
 import useMediaServerNavigationStore from '../store/mediaServerNavigation'
 import type { MediaServerConfig, MediaServerType } from '../types/mediaServer'
 import message from '../utils/message'
+import { Modal } from '@arco-design/web-vue'
+import { deleteMediaServerItem } from '../media-server/deleteMedia'
 import { openExternal } from '../utils/electronhelper'
 import { modalDownload } from '../utils/modal'
 import useMediaServerContentStore from '../store/mediaServerContent'
@@ -1404,6 +1477,7 @@ const selectedSeasonId = ref('')
 const selectedEpisodeId = ref('')
 const selectedSourceId = ref('')
 const versionMenuVisible = ref(false)
+const topVersionMenuVisible = ref(false)
 const detailSimilarItems = ref<MediaServerLibraryNode[]>([])
 const homeLibraryManagerVisible = ref(false)
 const draggingHomeLibraryId = ref('')
@@ -1423,10 +1497,9 @@ const activeMediaInfoCard = ref<MediaServerMediaInfoCard | null>(null)
 const selectedAudioStreamIndex = ref<number>(-1)
 const selectedSubtitleStreamIndex = ref<number>(-1)
 const detailLogoLoadFailed = ref(false)
-const MEDIA_SERVER_PLAYLIST_KEY = 'MediaServer_Playlist'
+const detailBackdropLoadFailed = ref(false)
 const MEDIA_SERVER_ICON_SET_URLS_KEY = 'MediaServer_IconSetUrls'
 const MEDIA_SERVER_PRIMARY_LINE_KEY = '__primary__'
-const playlistIds = ref<string[]>([])
 const serverIconManagerVisible = ref(false)
 const addServerIconSetVisible = ref(false)
 const serverIconSearchText = ref('')
@@ -1469,7 +1542,6 @@ const writeLocalIdList = (key: string, items: string[]) => {
   localStorage.setItem(key, JSON.stringify(items))
 }
 
-playlistIds.value = readLocalIdList(MEDIA_SERVER_PLAYLIST_KEY)
 serverIconSetUrls.value = readLocalIdList(MEDIA_SERVER_ICON_SET_URLS_KEY)
 
 const currentRoute = computed(() => navigation.currentRoute)
@@ -1607,7 +1679,7 @@ const homePosterMode = computed<MediaServerPosterType>(() => {
   if (homePreferences.nextUpPosterType === 'landscape') return 'landscape'
   return 'portrait'
 })
-const currentLibraryItems = computed<MediaServerLibraryNode[]>(() => {
+const rawCurrentLibraryItems = computed<MediaServerLibraryNode[]>(() => {
   const serverId = registry.currentServer?.id || ''
   if (!serverId) return []
   if (currentRoute.value.kind === 'library-root') {
@@ -1624,6 +1696,7 @@ const currentLibraryItems = computed<MediaServerLibraryNode[]>(() => {
   }
   return []
 })
+const currentLibraryItems = computed(() => sortListing(rawCurrentLibraryItems.value))
 const currentPagedLibrary = computed(() => {
   const serverId = registry.currentServer?.id || ''
   if (!serverId) {
@@ -1726,7 +1799,7 @@ const currentCollection = computed(() => {
   const kind = currentRoute.value.collectionId === 'home:latest' ? 'latest' : 'nextup'
   return content.currentCollection(`${serverId}:${kind}`)
 })
-const currentCollectionItems = computed<MediaServerLibraryNode[]>(() => currentCollection.value.items)
+const currentCollectionItems = computed<MediaServerLibraryNode[]>(() => sortListing(currentCollection.value.items))
 const currentCollectionLoading = computed(() => {
   const serverId = registry.currentServer?.id || ''
   const kind = currentCollectionKind.value
@@ -1745,7 +1818,13 @@ const currentCollectionKind = computed<'latest' | 'nextup' | null>(() => {
   if (currentRoute.value.collectionId === 'home:nextup') return 'nextup'
   return null
 })
+const selectedRootLibraries = ref<string[]>([])
+function toggleRootLibrary(id: string) { selectedRootLibraries.value = selectedRootLibraries.value.includes(id) ? selectedRootLibraries.value.filter(key => key !== id) : [...selectedRootLibraries.value, id] }
+function favoriteSelectedLibraries() { const server = registry.currentServer; if (server) emit('categoryFavorites', currentLibraryItems.value.filter(item => selectedRootLibraries.value.includes(item.id)).map(item => 'home-entry/' + encodeURIComponent(`${server.id}:${item.id}`))) }
+defineExpose({ favoriteSelectedLibraries, playServerCategory: (serverId: string, libraryId: string, mode: 'play' | 'loop' | 'shuffle') => playServerCategory(serverId, libraryId, mode), posterAction: (item: MediaServerCardItem | MediaServerLibraryNode, action: PosterAction) => handleServerPosterAction(item, action) })
 const currentListingPosterType = computed(() => {
+  if (props.unifiedRoot) return 'landscape' as const
+  if (props.unifiedBrowse) return 'portrait' as const
   if (currentRoute.value.kind === 'collection-page') {
     return currentCollectionKind.value === 'nextup'
       ? homePreferences.nextUpPosterType
@@ -1757,6 +1836,7 @@ const currentListingPosterType = computed(() => {
   return 'portrait' as const
 })
 const currentListingBrowseMode = computed(() => {
+  if (props.unifiedBrowse || props.unifiedRoot) return props.browseMode || 'grid'
   if (currentRoute.value.kind === 'collection-page') return homePreferences.collectionBrowseMode
   if (currentRoute.value.kind === 'library-page' || currentRoute.value.kind === 'genre-page' || currentRoute.value.kind === 'studio-page') {
     return homePreferences.latestInLibraryBrowseMode
@@ -1764,6 +1844,7 @@ const currentListingBrowseMode = computed(() => {
   return 'grid' as const
 })
 const listingShellClass = computed(() => [
+  props.unifiedBrowse ? 'unified-listing' : '',
   currentListingPosterType.value === 'portrait' ? 'library-shell-portrait' : 'library-shell-landscape',
   currentListingBrowseMode.value === 'list' ? 'library-shell-list' : 'library-shell-grid'
 ])
@@ -1799,7 +1880,7 @@ const currentPageTitle = computed(() => {
 })
 const currentBackLabel = computed(() => {
   if (currentRoute.value.kind === 'item-detail') {
-    return detailDisplayedItem.value.title || currentRoute.value.title || '返回'
+    return currentDetail.value?.title || currentRoute.value.title || detailDisplayedItem.value.title || '返回'
   }
   if (currentRoute.value.kind === 'library-page') return currentRoute.value.title || '媒体库'
   if (currentRoute.value.kind === 'studio-page') return currentRoute.value.title || '工作室'
@@ -1893,7 +1974,7 @@ const compareEpisodeItems = (left: MediaServerLibraryNode, right: MediaServerLib
 
 const pickLibraryListingImage = (item?: MediaServerLibraryNode) => {
   if (!item) return ''
-  if (currentRoute.value.kind === 'library-root') return pickPrimaryImage(item) || pickLandscapeImage(item)
+  if (currentRoute.value.kind === 'library-root') return wrapCacheUrl(item.images?.primary || item.poster || item.images?.thumb || item.images?.backdrop || item.backdrop || '')
   return currentListingPosterType.value === 'landscape'
     ? pickLandscapeImage(item)
     : pickPrimaryImage(item)
@@ -1916,11 +1997,8 @@ const handleCardImageLoad = (event: Event) => {
   frame?.classList.remove('is-broken')
 }
 
-const handleBackdropImageError = (event: Event) => {
-  const target = event.target as HTMLImageElement | null
-  if (target) {
-    target.style.display = 'none'
-  }
+const handleBackdropImageError = () => {
+  detailBackdropLoadFailed.value = true
 }
 
 const detailBackdropUrl = computed(() => {
@@ -1928,14 +2006,8 @@ const detailBackdropUrl = computed(() => {
   return wrapCacheUrl(upscaleHeroImageUrl(currentDetail.value.images?.backdrop))
 })
 
-const detailHeroPosterImage = computed(() => {
-  const detailImage = pickPrimaryImage(currentDetail.value)
-  if (detailImage) return detailImage
-  return pickPrimaryImage(detailDisplayedItem.value)
-})
-
 const detailLogoUrl = computed(() => {
-  if (!currentDetail.value || detailLogoLoadFailed.value) return ''
+  if (!currentDetail.value || !displayScopeAllows(generalPreferences.logo, currentDetail.value.kind === 'movie') || detailLogoLoadFailed.value) return ''
   return wrapCacheUrl(resolveMediaServerImage(currentDetail.value, 'logo'))
 })
 
@@ -2044,16 +2116,27 @@ const detailMediaCards = computed<MediaServerMediaInfoCard[]>(() => {
   })
 })
 
+const detailFileSummary = computed(() => mediaFileSummary(
+  selectedSourceOption.value?.fileSubLabel || detailDisplayedItem.value.fileSubLabel,
+  detailMediaCards.value
+))
+
 const selectSourceOption = (sourceId: string) => {
   selectedSourceId.value = sourceId
   versionMenuVisible.value = false
+  topVersionMenuVisible.value = false
 }
 
 const detailIsWatched = computed(() => detailDisplayedItem.value.isPlayed === true)
 const detailIsFavorite = computed(() => detailDisplayedItem.value.isFavorite === true)
-const detailInPlaylist = computed(() => !!detailDisplayedItem.value.id && playlistIds.value.includes(detailDisplayedItem.value.id))
 
+const detailPlayResume = computed(() => detailResumeState(
+  (detailDisplayedItem.value.playbackPositionTicks || 0) / 10_000_000,
+  detailDisplayedItem.value.progress === undefined ? (detailDisplayedItem.value.runtimeMinutes || 0) * 60 : undefined,
+  detailDisplayedItem.value.progress
+))
 const detailPlayLabel = computed(() => {
+  if (detailPlayResume.value) return detailPlayResume.value.label
   const match = detailDisplayedItem.value.title.match(/S(\d+)E(\d+)/i)
   if (match) return `S${match[1]} • E${match[2]}`
   if (detailDisplayedItem.value.kind === 'episode') return '继续播放'
@@ -2081,7 +2164,9 @@ const detailDownloadOptions = computed<Array<{ key: DetailDownloadScope; label: 
   return [{ key: 'current', label: '下载', description: item.title }]
 })
 
-const currentOverviewText = computed(() => detailDisplayedItem.value.overview || currentDetail.value?.overview || '')
+const currentOverviewText = computed(() => detailDisplayedItem.value.overview?.trim()
+  || currentDetail.value?.overview?.trim()
+  || '')
 
 const detailEpisodeHeading = computed(() => {
   if (!currentDetail.value) return ''
@@ -2502,8 +2587,14 @@ watch(() => [registry.currentServer?.id, currentRoute.value.kind] as const, ([se
 
 watch(() => currentDetail.value?.id, () => {
   detailLogoLoadFailed.value = false
+  detailBackdropLoadFailed.value = false
 })
 
+watch(() => [detailBackdropUrl.value, personBackdropUrl.value] as const, () => {
+  detailBackdropLoadFailed.value = false
+})
+
+const pageOrder = () => props.unifiedBrowse ? { sort: props.serverSort, direction: props.serverSortDirection } : {}
 const loadCurrentLibrary = async (force = false) => {
   if (!registry.currentServer) return
   try {
@@ -2512,14 +2603,14 @@ const loadCurrentLibrary = async (force = false) => {
       return
     }
     if (currentRoute.value.kind === 'library-page') {
-      await content.queueLibraryPageLoad(registry.currentServer, currentRoute.value.libraryId, force, true)
+      await content.queueLibraryPageLoad(registry.currentServer, currentRoute.value.libraryId, force, true, pageOrder())
       return
     }
     if (currentRoute.value.kind === 'genre-page') {
       await content.loadFilteredPage(
         registry.currentServer,
         `genre:${currentRoute.value.genre}`,
-        { genre: currentRoute.value.genre },
+        { genre: currentRoute.value.genre, order: pageOrder() },
         force
       )
       return
@@ -2528,7 +2619,7 @@ const loadCurrentLibrary = async (force = false) => {
       await content.loadFilteredPage(
         registry.currentServer,
         `studio:${currentRoute.value.studio}`,
-        { studio: currentRoute.value.studio },
+        { studio: currentRoute.value.studio, order: pageOrder() },
         force
       )
     }
@@ -2537,7 +2628,7 @@ const loadCurrentLibrary = async (force = false) => {
   }
 }
 
-const isDetailCandidate = (item: MediaServerLibraryNode) => ['movie', 'series', 'season', 'episode'].includes(item.kind)
+const isDetailCandidate = (item: MediaServerLibraryNode) => ['movie', 'series', 'season', 'episode', 'person'].includes(item.kind)
 const handleCardClick = (item: MediaServerCardItem) => {
   handleLibraryItemClick(item.id, item.title, item as MediaServerLibraryNode)
 }
@@ -2558,6 +2649,7 @@ const refreshHomeAfterMediaAction = async () => {
 const openMediaServerPlayback = async (
   item: MediaServerCardItem | MediaServerItemDetail,
   options?: {
+    server?: MediaServerConfig
     sourceId?: string
     sourceLabel?: string
     sourceOptions?: Array<{ id: string, label: string, subLabel?: string }>
@@ -2571,10 +2663,11 @@ const openMediaServerPlayback = async (
     audioLabel?: string
     subtitleLabel?: string
     playlistLabel?: string
+    playlistLoop?: boolean
     episodePlaylist?: Array<{ id: string, title: string }>
   }
 ) => {
-  const server = registry.currentServer
+  const server = options?.server || registry.currentServer
   if (!server || !item.id) return
   const playback = await getMediaServerPlaybackInfo(
     server,
@@ -2620,9 +2713,11 @@ const openMediaServerPlayback = async (
       media_server_audio_options: options?.audioOptions || [],
       media_server_subtitle_options: options?.subtitleOptions || [],
       media_server_playlist_label: options?.playlistLabel || '',
+      playlist_loop: options?.playlistLoop === true,
       media_server_episode_playlist: options?.episodePlaylist || []
     }
   })
+  if (window.WebOpenWindow) registry.recordPlayback(server.id)
 }
 
 const cleanDownloadSegment = (value: string) => {
@@ -2660,9 +2755,9 @@ const loadAllMediaServerChildren = async (server: MediaServerConfig, parentId: s
 
 const enqueueMediaServerDownloadItems = async (
   items: Array<MediaServerCardItem | MediaServerItemDetail | MediaServerLibraryNode>,
-  options?: { folderSegments?: string[]; sourceId?: string }
+  options?: { folderSegments?: string[]; sourceId?: string; server?: MediaServerConfig }
 ) => {
-  const server = registry.currentServer
+  const server = options?.server || registry.currentServer
   const basePath = mediaServerDownloadBasePath()
   if (!server || !basePath || items.length === 0) return
 
@@ -2814,12 +2909,21 @@ const resolveHomeDownloadItems = async (server: MediaServerConfig, item: MediaSe
   return [item]
 }
 
-const playHomeMediaItem = async (item: MediaServerCardItem | MediaServerLibraryNode) => {
-  const server = registry.currentServer
+const playHomeMediaItem = async (item: MediaServerCardItem | MediaServerLibraryNode, mode: 'play' | 'loop' | 'shuffle' = 'play') => {
+  const server = ('serverId' in item && item.serverId ? registry.servers.find(server => server.id === item.serverId) : registry.currentServer)
   if (!server) return
   try {
     const target = await resolveHomePlaybackTarget(server, item)
+    if (mode !== 'play') {
+      const entries = await resolveHomeDownloadItems(server, item)
+      if (mode === 'shuffle') {
+        for (let i = entries.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [entries[i], entries[j]] = [entries[j], entries[i]] }
+      }
+      if (entries.length) { target.item = entries[0]; target.episodePlaylist = entries.map(entry => ({ id: entry.id, title: entry.title })) }
+    }
     await openMediaServerPlayback(target.item, {
+      server,
+      playlistLoop: mode === 'loop',
       playlistLabel: target.playlistLabel,
       episodePlaylist: target.episodePlaylist
     })
@@ -2829,30 +2933,104 @@ const playHomeMediaItem = async (item: MediaServerCardItem | MediaServerLibraryN
   }
 }
 
-const handleHomeMediaAction = async (item: MediaServerCardItem | MediaServerLibraryNode, action: 'watched' | 'favorite' | 'download') => {
-  const server = registry.currentServer
+/** A category plays like a folder favorite: its first title, or a random one for shuffle. */
+const playServerCategory = async (serverId: string, libraryId: string, mode: 'play' | 'loop' | 'shuffle') => {
+  const server = registry.servers.find(server => server.id === serverId)
+  if (!server) return
+  try {
+    const children = (await content.loadLibraryPage(server, libraryId, false, true))
+      .filter(child => ['movie', 'episode', 'series', 'season'].includes(child.kind))
+    if (children.length === 0) throw new Error('没有找到可播放内容')
+    const first = mode === 'shuffle' ? children[Math.floor(Math.random() * children.length)] : children[0]
+    await playHomeMediaItem({ ...first, serverId: server.id } as MediaServerLibraryNode, mode)
+  } catch (error: any) {
+    message.error(error?.message || '媒体服务器播放失败')
+  }
+}
+
+const serverDeletePending = new Set<string>()
+const handleServerPosterAction = async (item: MediaServerCardItem | MediaServerLibraryNode, action: PosterAction) => {
+ if (action === 'playlist') {
+  const server = ('serverId' in item && item.serverId ? registry.servers.find(server => server.id === item.serverId) : registry.currentServer)
+  if (server) openServerPlaylist({ config: server, itemId: item.id, title: item.title })
+  return
+ }
+ if (action === 'rating') {
+  const server = registry.servers.find(server => server.id === item.serverId)
+  if (!server) return
+  try { openServerPersonalRating(await content.loadItemDetail(server, item.id)) }
+  catch (error) { message.error(error instanceof Error ? error.message : String(error)) }
+  return
+ }
+ if (action === 'delete') {
+  const server = ('serverId' in item && item.serverId ? registry.servers.find(server => server.id === item.serverId) : registry.currentServer)
   if (!server || !item.id) return
+  const key = server.id + ':' + item.id
+  Modal.confirm({
+    title: t('posterMenu.deleteServerConfirm'),
+    content: t('posterMenu.deleteServerWarning', { server: server.name, title: item.title }) + (item.kind === 'series' || item.kind === 'season' ? ' ' + t('posterMenu.deleteServerChildren') : ''),
+    onBeforeOk: async () => {
+      if (serverDeletePending.has(key)) return false
+      serverDeletePending.add(key)
+      try {
+        await deleteMediaServerItem(server, item.id)
+      } catch (error) {
+        message.error(error instanceof Error ? error.message : String(error))
+        return false
+      } finally { serverDeletePending.delete(key) }
+      message.success(t('posterMenu.deleteSucceeded'))
+      try { await refreshHomeAfterMediaAction(); if (currentRoute.value.kind === 'collection-page') await loadCurrentCollection(true); else await loadCurrentLibrary(true) }
+      catch (error) { message.error(error instanceof Error ? error.message : String(error)) }
+      window.dispatchEvent(new CustomEvent('boxplayer:server-media-deleted'))
+      return true
+    }
+  })
+  return
+ }
+ if (action === 'share') { openMediaShare({ id: item.id, title: item.title, year: item.year }); return }
+ if (action === 'play' || action === 'loop' || action === 'shuffle') { await playHomeMediaItem(item, action); return }
+ if (action === 'refresh') { await refreshHomeAfterMediaAction(); if (currentRoute.value.kind === 'collection-page') await loadCurrentCollection(true); else await loadCurrentLibrary(true); return }
+ if ((action === 'watched' || action === 'favorite') && currentRoute.value.kind === 'item-detail' && item.id === detailDisplayedItem.value.id) {
+   await handleDetailAction(action)
+   return
+ }
+ if (action === 'watched' || action === 'favorite' || action === 'download') await handleHomeMediaAction(item, action)
+}
+const watchedPending = ref(new Set<string>())
+const handleHomeMediaAction = async (item: MediaServerCardItem | MediaServerLibraryNode, action: 'watched' | 'favorite' | 'download' | 'series' | 'share' | 'loop' | 'shuffle' | 'delete' | 'continue' | 'rating') => {
+  if (action === 'rating') { await handleServerPosterAction(item, action); return }
+  if (action === 'continue') return // Local-only action; server resume lists are managed by the provider.
+  const server = ('serverId' in item && item.serverId ? registry.servers.find(server => server.id === item.serverId) : registry.currentServer)
+  if (!server || !item.id) return
+  if (action === 'delete') { await handleServerPosterAction(item, action); return }
+  if (action === 'loop' || action === 'shuffle') { await playHomeMediaItem(item, action); return }
+  if (action === 'share') { openMediaShare({ id: item.id, title: item.title, year: item.year }); return }
+  if (action === 'series') { openCustomSeries({ id: item.id, title: item.title, serverId: server.id }); return }
   try {
     if (action === 'download') {
       const downloadItems = await resolveHomeDownloadItems(server, item)
-      await enqueueMediaServerDownloadItems(downloadItems, { folderSegments: item.kind === 'series' || item.kind === 'season' ? [item.title] : item.parentTitle ? [item.parentTitle] : [] })
+      await enqueueMediaServerDownloadItems(downloadItems, { server, folderSegments: item.kind === 'series' || item.kind === 'season' ? [item.title] : item.parentTitle ? [item.parentTitle] : [] })
       return
     }
     if (action === 'watched') {
+      if (watchedPending.value.has(item.id)) return
+      watchedPending.value.add(item.id)
       const wasPlayed = item.isPlayed === true
       await updateMediaServerPlayedState(server, item.id, wasPlayed)
-      await refreshHomeAfterMediaAction()
+      item.isPlayed = !wasPlayed
+      await Promise.all([refreshHomeAfterMediaAction(), currentRoute.value.kind === 'collection-page' ? loadCurrentCollection(true) : loadCurrentLibrary(true)])
       message.success(wasPlayed ? '已标记为未观看' : '已标记为已观看')
       return
     }
 
     const wasFavorite = item.isFavorite === true
-    await updateMediaServerFavoriteState(server, item.id, wasFavorite)
+    await updateMediaServerFavoriteState(server, item.id, wasFavorite, item)
+    item.isFavorite = !wasFavorite
     await refreshHomeAfterMediaAction()
     message.success(wasFavorite ? '已取消收藏' : '已加入收藏')
   } catch (error: any) {
     message.error(error?.message || '操作失败')
-  }
+  } finally { watchedPending.value.delete(item.id) }
 }
 
 const openHomeCollection = (kind: 'latest' | 'nextup', title: string) => {
@@ -3016,7 +3194,6 @@ const getListingSubtitle = (item: MediaServerLibraryNode) => {
 }
 
 const getListingOverlay = (item: MediaServerLibraryNode) => {
-  if (typeof item.rating === 'number') return `★ ${item.rating.toFixed(1)}`
   if (item.year) return `${item.year}`
   if (item.kind === 'series') return '剧集'
   if (item.kind === 'movie') return '电影'
@@ -3047,8 +3224,10 @@ const getListingKindLabel = (item: MediaServerLibraryNode) => {
 
 const getListingMetaItems = (item: MediaServerLibraryNode) => {
   const parts = [
-    item.year ? `${item.year}` : '',
-    typeof item.rating === 'number' ? `评分 ${item.rating.toFixed(1)}` : '',
+    typeof item.rating === 'number' ? `☆ ${item.rating.toFixed(1)}` : '',
+    item.premiereDate?.slice(0, 10) || (item.year ? `${item.year}` : ''),
+    item.productionLocations?.join(', ') || '',
+    item.genres?.join(', ') || '',
     formatRuntimeMinutes(item.runtimeMinutes),
     item.parentTitle && item.parentTitle !== item.title ? item.parentTitle : ''
   ].filter(Boolean)
@@ -3088,7 +3267,7 @@ const selectDetailEpisode = async (episodeId: string) => {
   }
 }
 
-const handleDetailAction = async (action: 'watched' | 'favorite' | 'playlist') => {
+const handleDetailAction = async (action: 'watched' | 'favorite') => {
   const itemId = detailDisplayedItem.value.id
   const server = registry.currentServer
   if (!itemId || !server) return
@@ -3096,7 +3275,12 @@ const handleDetailAction = async (action: 'watched' | 'favorite' | 'playlist') =
     const wasPlayed = detailIsWatched.value
     try {
       await updateMediaServerPlayedState(server, itemId, wasPlayed)
+      for (const episode of detailEpisodeItems.value) {
+        if (episode.id === itemId || detailDisplayedItem.value.kind === 'series' || detailDisplayedItem.value.kind === 'season') episode.isPlayed = !wasPlayed
+      }
       await content.loadItemDetail(server, itemId, true)
+      const episodeParentId = activeDetailSeason.value?.id || (currentDetail.value?.kind === 'season' ? currentDetail.value.id : '')
+      if (episodeParentId) await content.loadLibraryPage(server, episodeParentId, true, false)
       if (currentDetail.value?.id && currentDetail.value.id !== itemId) {
         await content.loadItemDetail(server, currentDetail.value.id, true)
       }
@@ -3106,26 +3290,17 @@ const handleDetailAction = async (action: 'watched' | 'favorite' | 'playlist') =
     }
     return
   }
-  if (action === 'favorite') {
-    const wasFavorite = detailIsFavorite.value
-    try {
-      await updateMediaServerFavoriteState(server, itemId, wasFavorite)
-      await content.loadItemDetail(server, itemId, true)
-      if (currentDetail.value?.id && currentDetail.value.id !== itemId) {
-        await content.loadItemDetail(server, currentDetail.value.id, true)
-      }
-      message.success(wasFavorite ? '已取消收藏' : '已加入收藏')
-    } catch (error: any) {
-      message.error(error?.message || '收藏操作失败')
+  const wasFavorite = detailIsFavorite.value
+  try {
+    await updateMediaServerFavoriteState(server, itemId, wasFavorite, detailDisplayedItem.value)
+    await content.loadItemDetail(server, itemId, true)
+    if (currentDetail.value?.id && currentDetail.value.id !== itemId) {
+      await content.loadItemDetail(server, currentDetail.value.id, true)
     }
-    return
+    message.success(wasFavorite ? '已取消收藏' : '已加入收藏')
+  } catch (error: any) {
+    message.error(error?.message || '收藏操作失败')
   }
-  const next = detailInPlaylist.value
-    ? playlistIds.value.filter((id) => id !== itemId)
-    : [...playlistIds.value, itemId]
-  playlistIds.value = next
-  writeLocalIdList(MEDIA_SERVER_PLAYLIST_KEY, next)
-  message.success(detailInPlaylist.value ? '已加入播放列表' : '已移出播放列表')
 }
 
 const handleDetailPlay = async () => {
@@ -3238,11 +3413,18 @@ const loadCurrentCollection = async (force = false) => {
     await content.queueCollectionPageLoad(registry.currentServer, kind, {
       resumeNextUp: homePreferences.resumeNextUp,
       maxNextUpDays: homePreferences.maxNextUpDays
-    }, force)
+    }, force, pageOrder())
   } catch {
     // store keeps error state
   }
 }
+
+// Sort changes start a new server-side result set; scrolling owns subsequent pages.
+watch(() => [props.unifiedBrowse, props.serverSort, props.serverSortDirection], () => {
+  if (!props.unifiedBrowse) return
+  if (currentRoute.value.kind === 'collection-page') void loadCurrentCollection(true)
+  else if (['library-page', 'genre-page', 'studio-page'].includes(currentRoute.value.kind)) void loadCurrentLibrary(true)
+})
 
 const handleWorkspaceScroll = () => {
   if (!workspacePageRef.value) return
@@ -3264,12 +3446,23 @@ const handleWorkspaceScroll = () => {
   }
 }
 
+// A very wide/tall window may fit the first page without a scrollbar. Fill
+// only that viewport; subsequent pages still require scrolling near the bottom.
+watch(() => [currentLibraryItems.value.length, currentCollectionItems.value.length,
+  currentLibraryPageLoading.value, currentCollectionLoading.value, props.browseMode], async () => {
+  await nextTick()
+  const element = workspacePageRef.value
+  if (!element || !element.clientHeight || element.scrollHeight > element.clientHeight + 1) return
+  if (currentLibraryError.value || currentCollectionError.value) return
+  handleWorkspaceScroll()
+}, { flush: 'post' })
+
 const handleLibraryItemClick = (itemId: string, title: string, item?: MediaServerLibraryNode) => {
   if (item && isDetailCandidate(item)) {
     navigation.push({ kind: 'item-detail', itemId, title })
     return
   }
-  navigation.push({ kind: 'library-page', libraryId: itemId, title })
+  navigation.push({ kind: 'library-page', libraryId: ['BoxSet', 'Playlist'].includes(item?.rawType || '') ? `server-container:${itemId}` : itemId, title })
 }
 
 const handleSearchItemSelect = (item: MediaServerLibraryNode) => {
@@ -3321,6 +3514,7 @@ const loadCurrentDetail = async (force = false) => {
     selectedEpisodeId.value = ''
     selectedSourceId.value = ''
     versionMenuVisible.value = false
+    topVersionMenuVisible.value = false
     detailSimilarError.value = ''
     if (force) detailSimilarItems.value = []
     await Promise.all([
@@ -3347,6 +3541,20 @@ watch(() => [
   if (serverId && (routeKind === 'item-detail' || routeKind === 'person-page')) {
     loadCurrentDetail(false)
   }
+})
+
+watch(() => [
+  currentRoute.value.kind,
+  currentRoute.value.kind === 'item-detail'
+    ? currentRoute.value.itemId
+    : currentRoute.value.kind === 'person-page'
+      ? currentRoute.value.personId
+      : currentRoute.value.kind === 'library-page'
+        ? currentRoute.value.libraryId
+        : ''
+] as const, async () => {
+  await nextTick()
+  workspacePageRef.value?.scrollTo({ top: 0, left: 0, behavior: 'auto' })
 })
 
 watch(() => [currentDetail.value?.id, currentDetail.value?.kind, detailSeasonMenu.value.map((item) => item.id).join(',')] as const, async ([detailId, detailKind]) => {
@@ -3383,6 +3591,7 @@ watch(() => detailEpisodeItems.value.map((item) => item.id).join(','), async (ep
 watch(() => detailDisplayedItem.value.id, () => {
   selectedSourceId.value = ''
   versionMenuVisible.value = false
+  topVersionMenuVisible.value = false
   mediaInfoModalVisible.value = false
   activeMediaInfoCard.value = null
   selectedAudioStreamIndex.value = -1
@@ -3476,6 +3685,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.server-file-download{flex-shrink:0;padding:12px;border:0;background:transparent;color:var(--color-text-2);cursor:pointer}.server-file-download:focus-visible{outline:2px solid #ff8b25}
 .media-server-workspace {
   height: 100%;
   overflow: hidden;
@@ -3751,13 +3961,12 @@ onUnmounted(() => {
   padding: 8px;
   min-width: 240px;
   border-radius: 24px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.54), rgba(244, 248, 255, 0.36));
+  background: var(--app-overlay-bg);
   border: 1px solid rgba(255, 255, 255, 0.56);
   box-shadow:
     0 22px 48px rgba(0, 0, 0, 0.16),
     inset 0 1px 0 rgba(255, 255, 255, 0.42);
-  backdrop-filter: blur(24px) saturate(145%);
+  backdrop-filter: none;
 }
 
 :deep(.server-switch-dropdown .arco-dropdown-list-wrapper),
@@ -4509,6 +4718,16 @@ onUnmounted(() => {
 
 .collection-loading-inline {
   margin-top: 8px;
+  justify-content: center;
+}
+
+.collection-page-initial-loading {
+  min-height: 100%;
+}
+
+.collection-initial-loading {
+  flex: 1;
+  min-height: 320px;
 }
 
 .statistics-row {
@@ -5054,19 +5273,17 @@ onUnmounted(() => {
   background:
     radial-gradient(circle at top, rgba(255, 255, 255, 0.42), transparent 56%),
     linear-gradient(180deg, rgba(226, 232, 240, 0.92) 0%, rgba(203, 213, 225, 0.96) 100%);
-  color: transparent;
+  color: var(--color-text-3, #86909c);
   user-select: none;
 }
 
 .person-placeholder::before {
-  content: '';
-  width: clamp(40px, 40%, 58px);
-  height: clamp(40px, 40%, 58px);
-  border-radius: 16px;
-  background: center / contain no-repeat var(--app-icon-image);
-  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.28);
-  filter: grayscale(1) brightness(0.72) contrast(0.92);
-  opacity: 0.88;
+  content: none;
+}
+
+.person-placeholder-icon {
+  width: 48%;
+  height: 48%;
 }
 
 .person-name {
@@ -6028,6 +6245,7 @@ onUnmounted(() => {
   min-height: clamp(940px, 96vh, 1180px);
   overflow: hidden;
   border-radius: 0;
+  background: linear-gradient(180deg, rgba(122, 101, 88, 0.82), rgba(208, 190, 176, 0.76));
 }
 
 .detail-backdrop-image,
@@ -6194,14 +6412,14 @@ onUnmounted(() => {
 
 .detail-overlay-grid {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: 240px minmax(0, 1fr);
   column-gap: 30px;
   align-items: end;
   width: min(1880px, 100%);
 }
 
 .detail-hero-poster {
-  width: 280px;
+  width: 240px;
   aspect-ratio: 2 / 3;
   border-radius: 24px;
   overflow: hidden;
@@ -6606,20 +6824,35 @@ onUnmounted(() => {
   display: block;
 }
 
-.detail-episode-selected-badge {
+.detail-episode-play-overlay {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 28px;
-  height: 28px;
-  border-radius: 999px;
+  z-index: 2;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #4a7df1;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 50%;
   color: #fff;
-  font-size: 16px;
-  font-weight: 800;
+  background: rgba(0, 0, 0, 0.48);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  opacity: 0.94;
+  cursor: pointer;
+}
+
+.detail-episode-play-overlay:hover,
+.detail-episode-play-overlay:focus-visible {
+  background: rgba(0, 0, 0, 0.72);
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+.detail-episode-play-overlay svg {
+  margin-left: 2px;
 }
 
 .detail-episode-progress {
@@ -6845,9 +7078,9 @@ onUnmounted(() => {
 
 .detail-media-modal :deep(.ant-modal-content) {
   border-radius: 28px;
-  background: rgba(247, 241, 234, 0.72);
+  background: var(--app-overlay-bg);
   border: 1px solid rgba(255, 255, 255, 0.72);
-  backdrop-filter: blur(24px);
+  backdrop-filter: none;
   box-shadow: 0 28px 60px rgba(56, 44, 30, 0.18);
 }
 
@@ -7079,7 +7312,7 @@ onUnmounted(() => {
   }
 
   .detail-hero-poster {
-    width: min(300px, 54vw);
+    width: min(240px, 54vw);
   }
 
   .detail-actions-column {
@@ -7312,6 +7545,13 @@ onUnmounted(() => {
     linear-gradient(180deg, rgba(12, 18, 26, 0.08) 0%, rgba(16, 24, 34, 0.16) 54%, rgba(12, 18, 26, 0.18) 100%);
 }
 
+[arco-theme='dark'] .detail-backdrop-stage,
+[arco-theme='dark'] .detail-backdrop-fallback {
+  background:
+    radial-gradient(circle at 28% 18%, rgba(58, 72, 88, 0.38), transparent 38%),
+    linear-gradient(180deg, #202a36 0%, #131b25 58%, #0c121a 100%);
+}
+
 [arco-theme='dark'] .workspace-toolbar,
 [arco-theme='dark'] .workspace-header-card,
 [arco-theme='dark'] .search-shell,
@@ -7352,7 +7592,7 @@ onUnmounted(() => {
 }
 
 [arco-theme='dark'] .detail-media-modal :deep(.ant-modal-content) {
-  background: rgba(18, 22, 30, 0.92);
+  background: var(--app-overlay-bg);
   border-color: rgba(255, 255, 255, 0.08);
   box-shadow: 0 28px 60px rgba(0, 0, 0, 0.4);
 }
@@ -7894,6 +8134,20 @@ onUnmounted(() => {
   background: rgba(255, 255, 255, 0.1) !important;
   border-color: rgba(255, 255, 255, 0.12) !important;
 }
+.unified-server-category .workspace-page { padding: 16px; }
+.unified-server-category .home-page { gap: 0; }
+.server-empty-folder { min-height: calc(100vh - 200px); }
+.unified-server-category .collection-intro { display: none; }
+.unified-listing.library-shell { margin-top: 0; }
+.unified-listing .library-card-grid { gap: 7px; }
+.unified-listing.library-shell-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 22px 20px; }
+.unified-listing.library-shell-list { gap: 0; }
+.unified-listing .library-card-list { gap: 22px; padding: 12px 0; border-radius: 0; border-bottom: 1px solid var(--color-border-2); background: transparent; }
+.unified-listing .library-card.library-card-list.library-card-portrait .library-cover { width: 98px; min-width: 98px; height: 147px; }
+.unified-listing .library-list-meta-chip { background: transparent; padding: 0; border: 0; font-size: 13px; }
+.unified-listing .library-list-overview { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+@media (max-width: 1100px) { .unified-listing.library-shell-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+@media (max-width: 800px) { .unified-listing.library-shell-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 </style>
 
 <style>
@@ -8214,10 +8468,10 @@ body:not([arco-theme='dark']) .home-library-manager-modal-shell .arco-modal-cont
 body:not([arco-theme='dark']) .detail-media-modal-shell .arco-modal-content {
   color: rgba(17, 24, 39, 0.94) !important;
   border: 1px solid rgba(15, 23, 42, 0.08) !important;
-  background: rgba(255, 255, 255, 0.88) !important;
+  background: var(--app-overlay-bg) !important;
   box-shadow: 0 28px 60px rgba(15, 23, 42, 0.14) !important;
-  backdrop-filter: blur(24px) saturate(1.2) !important;
-  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 body:not([arco-theme='dark']) .home-library-manager-modal .arco-modal-title,
@@ -8258,10 +8512,10 @@ body:not([arco-theme='dark']) .home-library-manager-modal-shell .home-library-ma
 body:not([arco-theme='dark']) .server-switch-menu {
   color: rgba(17, 24, 39, 0.92) !important;
   border: 1px solid rgba(15, 23, 42, 0.08) !important;
-  background: rgba(255, 255, 255, 0.88) !important;
+  background: var(--app-overlay-bg) !important;
   box-shadow: 0 24px 52px rgba(15, 23, 42, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.72) !important;
-  backdrop-filter: blur(24px) saturate(1.2) !important;
-  -webkit-backdrop-filter: blur(24px) saturate(1.2) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 body:not([arco-theme='dark']) .server-switch-menu .arco-dropdown-option,
@@ -8279,15 +8533,12 @@ body[arco-theme='dark'] .home-library-manager-modal.detail-media-modal .arco-mod
 body[arco-theme='dark'] .home-library-manager-modal-shell.detail-media-modal-shell .arco-modal-content {
   color: var(--app-mineradio-ink, #e8ecef) !important;
   border-color: var(--app-glass-line, rgba(255, 255, 255, 0.08)) !important;
-  background:
-    radial-gradient(circle at 72% 8%, rgba(0, 245, 212, 0.08), transparent 28%),
-    radial-gradient(circle at 12% 72%, rgba(36, 66, 255, 0.1), transparent 34%),
-    var(--app-mineradio-bg, #08090b) !important;
+  background: var(--app-overlay-bg) !important;
   box-shadow:
     0 28px 60px rgba(0, 0, 0, 0.42),
     inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
-  backdrop-filter: blur(24px) !important;
-  -webkit-backdrop-filter: blur(24px) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 body[arco-theme='dark'] .home-library-manager-modal.detail-media-modal .arco-modal-header,
@@ -8680,23 +8931,808 @@ body:not([arco-theme='dark']) #xbybody .media-server-workspace .detail-episode-t
   transform: none !important;
 }
 
-/* ── popup/dropdown glass background ── */
-#xbybody .arco-select-popup-container .arco-select-popup-inner,
-#xbybody .arco-trigger-popup-wrapper .arco-dropdown-list,
-#xbybody .arco-trigger-popup {
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 14px;
-  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.12);
-  backdrop-filter: blur(20px) saturate(1.2);
-  -webkit-backdrop-filter: blur(20px) saturate(1.2);
+/* All media-server image fallbacks share the same dark surface, including
+   home rows, library cards, detail posters, episode stills, and people. */
+body[arco-theme='dark'] #xbybody .media-server-workspace .media-image-placeholder {
+  background:
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.08), transparent 54%),
+    linear-gradient(180deg, rgb(44, 52, 66) 0%, rgb(28, 34, 46) 100%) !important;
 }
 
-body[arco-theme='dark'] #xbybody .arco-select-popup-container .arco-select-popup-inner,
-body[arco-theme='dark'] #xbybody .arco-trigger-popup-wrapper .arco-dropdown-list,
-body[arco-theme='dark'] #xbybody .arco-trigger-popup {
-  background: linear-gradient(180deg, rgba(24, 29, 40, 0.92), rgba(17, 21, 30, 0.88));
-  border-color: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+body[arco-theme='dark'] #xbybody .media-server-workspace .media-image-placeholder::before {
+  box-shadow: inset 0 0 0 1px rgba(203, 213, 225, 0.16) !important;
+  filter: grayscale(1) brightness(1.18) contrast(0.9) !important;
+  opacity: 0.72 !important;
+}
+
+body[arco-theme='dark'] #xbybody .media-server-workspace .media-image-placeholder:has(> .media-poster-placeholder-icon) {
+  background: #232625 !important;
+}
+
+/* ── Cinematic media detail, matched to the compact Emby-style reference. ── */
+#xbybody .media-server-workspace .detail-shell {
+  --detail-surface: #191919;
+  --detail-surface-soft: #242424;
+  --detail-copy: rgba(255, 255, 255, 0.94);
+  --detail-copy-muted: rgba(255, 255, 255, 0.66);
+  --detail-accent: #ff7a00;
+  gap: 0 !important;
+  min-height: 100%;
+  color: var(--detail-copy) !important;
+  background: var(--detail-surface) !important;
+}
+
+#xbybody .media-server-workspace .detail-shell::before,
+#xbybody .media-server-workspace .detail-page-backdrop,
+#xbybody .media-server-workspace .detail-page-tint {
+  display: none !important;
+}
+
+#xbybody .media-server-workspace .detail-backdrop-stage {
+  min-height: max(620px, calc(100vh - 140px)) !important;
+  overflow: hidden !important;
+  background: #242424 !important;
+}
+
+#xbybody .media-server-workspace .detail-backdrop-image,
+#xbybody .media-server-workspace .detail-backdrop-fallback {
+  top: 54px !important;
+  height: calc(100% - 54px) !important;
+}
+
+#xbybody .media-server-workspace .detail-backdrop-image {
+  object-position: center 10% !important;
+  filter: saturate(0.94) brightness(0.88);
+}
+
+#xbybody .media-server-workspace .detail-backdrop-fallback,
+body[arco-theme='dark'] #xbybody .media-server-workspace .detail-backdrop-fallback,
+body:not([arco-theme='dark']) #xbybody .media-server-workspace .detail-backdrop-fallback {
+  background:
+    radial-gradient(circle at 34% 12%, rgba(76, 87, 104, 0.38), transparent 35%),
+    linear-gradient(180deg, #28303a 0%, #20252d 46%, #191919 100%) !important;
+}
+
+#xbybody .media-server-workspace .detail-backdrop-mask {
+  top: 54px !important;
+  background:
+    linear-gradient(90deg, rgba(12, 12, 12, 0.18) 0%, rgba(12, 12, 12, 0.06) 45%, rgba(12, 12, 12, 0.16) 100%),
+    linear-gradient(180deg, rgba(12, 12, 12, 0.01) 0%, rgba(19, 19, 19, 0.03) 64%, rgba(25, 25, 25, 0.7) 87%, #191919 100%) !important;
+}
+
+#xbybody .media-server-workspace .detail-backdrop-bottom-haze {
+  left: 0 !important;
+  right: 0 !important;
+  bottom: -1px !important;
+  height: 32% !important;
+  border-radius: 0 !important;
+  filter: none !important;
+  background: linear-gradient(180deg, transparent 0%, rgba(25, 25, 25, 0.38) 54%, #191919 100%) !important;
+}
+
+#xbybody .media-server-workspace .detail-top-back {
+  position: absolute !important;
+  inset: 0 0 auto 0 !important;
+  z-index: 5 !important;
+  height: 54px !important;
+  padding: 0 12px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 18px !important;
+  background: #191919 !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04) !important;
+}
+
+#xbybody .media-server-workspace .detail-back-button {
+  min-width: 0 !important;
+  height: 54px !important;
+  padding: 0 !important;
+  gap: 12px !important;
+  color: rgba(255, 255, 255, 0.92) !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  font-size: 15px !important;
+  font-weight: 760 !important;
+}
+
+#xbybody .media-server-workspace .detail-back-button > .iconfont-svg {
+  width: 38px !important;
+  height: 38px !important;
+  padding: 9px !important;
+  overflow: visible !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 50% !important;
+  background: #222 !important;
+  box-sizing: border-box !important;
+  opacity: 1 !important;
+}
+
+#xbybody .media-server-workspace .detail-back-button > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#xbybody .media-server-workspace .detail-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+#xbybody .media-server-workspace .detail-top-icon-action {
+  position: relative;
+  height: 38px;
+  min-width: 38px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.78);
+  background: #222;
+  cursor: pointer;
+}
+
+#xbybody .media-server-workspace .detail-top-icon-action:hover,
+#xbybody .media-server-workspace .detail-top-icon-action.active {
+  color: #fff;
+  background: #303030;
+}
+
+#xbybody .media-server-workspace .detail-top-icon-action[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#xbybody .media-server-workspace .detail-top-actions > .detail-top-icon-action {
+  background: transparent;
+  border-color: transparent;
+}
+
+#xbybody .media-server-workspace .detail-top-action-plus {
+  margin-left: -7px;
+  margin-top: -10px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+#xbybody .media-server-workspace .detail-top-chevron {
+  width: 12px !important;
+  height: 12px !important;
+}
+
+#xbybody .media-server-workspace .detail-hero-copy {
+  inset: 54px 0 0 !important;
+  padding: 0 34px 12px !important;
+  justify-content: flex-end !important;
+}
+
+#xbybody .media-server-workspace .detail-overlay-grid {
+  width: 100% !important;
+  max-width: none !important;
+  grid-template-columns: minmax(232px, 280px) minmax(0, 1fr) !important;
+  column-gap: 34px !important;
+  align-items: end !important;
+}
+
+#xbybody .media-server-workspace .detail-hero-controls {
+  min-height: 242px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+#xbybody .media-server-workspace .detail-title-block-brand {
+  min-height: 74px;
+  margin: 0 0 18px !important;
+  display: flex;
+  align-items: flex-end;
+}
+
+#xbybody .media-server-workspace .detail-hero-logo {
+  max-width: 190px !important;
+  max-height: 82px !important;
+  object-position: left bottom !important;
+  filter: drop-shadow(0 8px 20px rgba(0, 0, 0, 0.42)) !important;
+}
+
+#xbybody .media-server-workspace .detail-actions-column {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  gap: 12px !important;
+}
+
+#xbybody .media-server-workspace .detail-play-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 46px;
+  align-items: center;
+  gap: 10px;
+}
+
+#xbybody .media-server-workspace .detail-primary-play {
+  order: 0;
+  width: 100% !important;
+  height: 46px !important;
+  min-height: 46px !important;
+  border: 0 !important;
+  border-radius: 999px !important;
+  color: rgba(25, 25, 25, 0.9) !important;
+  background: rgba(231, 231, 235, 0.72) !important;
+  box-shadow: none !important;
+  font-size: 14px !important;
+  font-weight: 780 !important;
+}
+
+#xbybody .media-server-workspace .detail-primary-play:hover {
+  color: #111 !important;
+  background: rgba(255, 255, 255, 0.9) !important;
+  box-shadow: none !important;
+}
+
+#xbybody .media-server-workspace .detail-primary-play.has-resume {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  color: #fff !important;
+  background: rgba(150, 157, 160, 0.5) !important;
+}
+#xbybody .media-server-workspace .detail-primary-play > .detail-play-progress {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 0;
+  background: rgba(235, 239, 240, 0.42);
+  border-right: 1px solid rgba(255, 255, 255, 0.3);
+  pointer-events: none;
+}
+
+#xbybody .media-server-workspace .detail-play-version-trigger {
+  width: 46px;
+  height: 46px;
+  min-width: 46px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 50%;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(62, 62, 62, 0.94);
+  cursor: pointer;
+}
+
+#xbybody .media-server-workspace .detail-play-version-trigger:hover {
+  color: #fff;
+  background: #505050;
+}
+
+#xbybody .media-server-workspace .detail-play-version-trigger[disabled] {
+  opacity: 0.52;
+  cursor: default;
+}
+
+#xbybody .media-server-workspace .detail-play-version-trigger > .iconfont-svg {
+  width: 18px;
+  height: 18px;
+}
+
+#xbybody .media-server-workspace .detail-icon-actions {
+  order: 1;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: stretch !important;
+  gap: 10px !important;
+  width: 100% !important;
+  max-width: none !important;
+}
+
+#xbybody .media-server-workspace .detail-square-action {
+  position: relative;
+  flex: 1 1 0 !important;
+  width: auto !important;
+  height: 44px !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 999px !important;
+  color: rgba(255, 255, 255, 0.86) !important;
+  background: rgba(49, 49, 49, 0.94) !important;
+  box-shadow: none !important;
+}
+
+#xbybody .media-server-workspace .detail-square-action:hover,
+#xbybody .media-server-workspace .detail-square-action.active {
+  color: #fff !important;
+  background: #414141 !important;
+  border-color: rgba(255, 255, 255, 0.2) !important;
+}
+
+#xbybody .media-server-workspace .detail-square-action > .iconfont-svg {
+  width: 18px;
+  height: 18px;
+}
+
+#xbybody .media-server-workspace .detail-action-plus {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+#xbybody .media-server-workspace .detail-hero-main {
+  min-height: 242px !important;
+  max-width: none !important;
+  justify-content: flex-end !important;
+  gap: 0 !important;
+}
+
+#xbybody .media-server-workspace .detail-synopsis-column {
+  width: min(100%, 1240px) !important;
+  max-width: none !important;
+  gap: 10px !important;
+  justify-content: flex-end !important;
+}
+
+#xbybody .media-server-workspace .detail-episode-heading {
+  color: var(--detail-copy) !important;
+  font-size: clamp(18px, 1.45vw, 28px) !important;
+  line-height: 1.28 !important;
+  font-weight: 780 !important;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.52) !important;
+}
+
+#xbybody .media-server-workspace .detail-facts-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 13px;
+  color: rgba(255, 255, 255, 0.64);
+  font-size: 13px;
+  line-height: 1.45;
+  font-weight: 650;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+
+#xbybody .media-server-workspace .detail-facts-line .detail-meta-badge {
+  padding: 1px 6px !important;
+  border: 1px solid rgba(255, 255, 255, 0.35) !important;
+  border-radius: 4px !important;
+  color: rgba(255, 255, 255, 0.82) !important;
+  background: transparent !important;
+  font-size: 11px !important;
+  line-height: 1.35 !important;
+}
+
+#xbybody .media-server-workspace .detail-overview-block {
+  padding: 0 !important;
+}
+
+#xbybody .media-server-workspace .detail-overview {
+  max-width: 1280px;
+  color: rgba(255, 255, 255, 0.84) !important;
+  font-size: 13px !important;
+  line-height: 1.55 !important;
+  font-weight: 520 !important;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5) !important;
+  -webkit-line-clamp: 2 !important;
+}
+
+#xbybody .media-server-workspace .detail-score-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 13px;
+}
+
+#xbybody .media-server-workspace .detail-score-logo {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  flex: 0 0 24px;
+}
+
+#xbybody .media-server-workspace .detail-lower-content {
+  display: flex !important;
+  flex-direction: column !important;
+  margin: 0 !important;
+  padding: 16px 34px 30px !important;
+  color: var(--detail-copy) !important;
+  background: var(--detail-surface) !important;
+}
+
+#xbybody .media-server-workspace .detail-section {
+  margin: 0 0 24px !important;
+}
+
+#xbybody .media-server-workspace .detail-section-episodes { order: 1; }
+#xbybody .media-server-workspace .detail-section-genres { order: 2; }
+#xbybody .media-server-workspace .detail-section-studios { order: 3; }
+#xbybody .media-server-workspace .detail-section-links { order: 4; }
+#xbybody .media-server-workspace .detail-section-people { order: 5; }
+#xbybody .media-server-workspace .detail-section-media { order: 6; }
+#xbybody .media-server-workspace .detail-section-similar { order: 7; }
+
+#xbybody .media-server-workspace .detail-section-header {
+  min-height: 24px;
+  margin-bottom: 10px !important;
+}
+
+#xbybody .media-server-workspace .detail-section-header h4 {
+  color: rgba(255, 255, 255, 0.9) !important;
+  font-size: 15px !important;
+  line-height: 1.35 !important;
+  font-weight: 760 !important;
+}
+
+#xbybody .media-server-workspace .detail-section-episodes > .detail-section-header h4::after {
+  content: '⌄';
+  display: inline-block;
+  margin-left: 5px;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 13px;
+}
+
+#xbybody .media-server-workspace .detail-season-picker {
+  margin-bottom: 10px !important;
+  gap: 8px !important;
+}
+
+#xbybody .media-server-workspace .detail-chip-button,
+#xbybody .media-server-workspace .detail-chip-link {
+  min-height: 30px !important;
+  padding: 5px 11px !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 999px !important;
+  color: rgba(255, 255, 255, 0.68) !important;
+  background: #242424 !important;
+  box-shadow: none !important;
+  font-size: 12px !important;
+}
+
+#xbybody .media-server-workspace .detail-chip-button.active {
+  color: #fff !important;
+  border-color: var(--detail-accent) !important;
+  background: rgba(255, 122, 0, 0.12) !important;
+}
+
+#xbybody .media-server-workspace .detail-episodes-rail,
+#xbybody .media-server-workspace .detail-recommendation-rail,
+#xbybody .media-server-workspace .detail-people-rail {
+  gap: 12px !important;
+  padding: 2px 0 8px !important;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+#xbybody .media-server-workspace .detail-episode-card {
+  width: clamp(150px, 12vw, 250px) !important;
+}
+
+#xbybody .media-server-workspace .detail-episode-cover {
+  height: auto !important;
+  aspect-ratio: 16 / 9 !important;
+  border-radius: 14px !important;
+  background: #262626 !important;
+  box-shadow: none !important;
+}
+
+#xbybody .media-server-workspace .detail-episode-card.selected .detail-episode-cover {
+  outline: 3px solid var(--detail-accent) !important;
+  outline-offset: -3px !important;
+}
+
+#xbybody .media-server-workspace .detail-episode-caption {
+  min-width: 0;
+  margin-top: 7px;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+#xbybody .media-server-workspace .detail-episode-index,
+#xbybody .media-server-workspace .detail-episode-kicker,
+#xbybody .media-server-workspace .detail-episode-title {
+  margin: 0 !important;
+  min-height: 0 !important;
+  color: inherit !important;
+  font: inherit !important;
+  display: inline !important;
+  overflow: visible !important;
+  background: transparent !important;
+}
+
+#xbybody .media-server-workspace .detail-episode-title {
+  min-width: 0;
+  overflow: hidden !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#xbybody .media-server-workspace .detail-section-people {
+  margin-top: 3px !important;
+}
+
+#xbybody .media-server-workspace .person-card.person-card-rail {
+  width: 82px !important;
+  min-width: 82px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  color: rgba(255, 255, 255, 0.86) !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  text-align: left !important;
+}
+
+#xbybody .media-server-workspace .person-card.person-card-button:hover {
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+#xbybody .media-server-workspace .person-avatar {
+  width: 72px !important;
+  height: 72px !important;
+  margin: 0 0 7px !important;
+  border-radius: 16px !important;
+  background: #262626 !important;
+}
+
+#xbybody .media-server-workspace .person-name {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.86) !important;
+  font-size: 12px !important;
+  line-height: 1.35 !important;
+  font-weight: 650 !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#xbybody .media-server-workspace .person-role {
+  margin-top: 2px !important;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.48) !important;
+  font-size: 11px !important;
+  line-height: 1.3 !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#xbybody .media-server-workspace .detail-section-media {
+  display: flex;
+  flex-direction: column;
+}
+
+#xbybody .media-server-workspace .detail-section-media > .detail-section-header {
+  display: none !important;
+}
+
+#xbybody .media-server-workspace .detail-file-bar {
+  order: 0;
+  margin: 3px 0 0 !important;
+  padding: 0 !important;
+  display: flex !important;
+  flex-direction: column;
+  gap: 2px;
+  border: 0 !important;
+  border-radius: 0 !important;
+  color: rgba(255, 255, 255, 0.5) !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  text-align: left !important;
+}
+
+#xbybody .media-server-workspace .detail-file-source {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+#xbybody .media-server-workspace .detail-file-name {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.48) !important;
+  font-size: 11px !important;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#xbybody .media-server-workspace .detail-file-path {
+  overflow-wrap: anywhere;
+  color: rgba(255, 255, 255, 0.48) !important;
+  font-size: 11px !important;
+  line-height: 1.4;
+}
+
+#xbybody .media-server-workspace .detail-file-meta {
+  align-self: flex-start;
+  max-width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  color: rgba(255, 255, 255, 0.52) !important;
+  font-size: 11px !important;
+  white-space: normal;
+}
+
+#xbybody .media-server-workspace .detail-media-card-rail {
+  order: 1;
+  margin-top: 26px;
+  padding-top: 8px !important;
+}
+
+#xbybody .media-server-workspace .detail-media-card {
+  min-height: 190px !important;
+  background: #222 !important;
+}
+
+@media (max-width: 980px) {
+  #xbybody .media-server-workspace .detail-backdrop-stage {
+    min-height: 760px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-overlay-grid {
+    grid-template-columns: 218px minmax(0, 1fr) !important;
+    column-gap: 24px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-icon-actions {
+    gap: 10px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-square-action {
+    width: auto !important;
+    height: 38px !important;
+    min-width: 0 !important;
+  }
+}
+
+@media (max-width: 720px) {
+  #xbybody .media-server-workspace .detail-backdrop-stage {
+    min-height: 840px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-hero-copy {
+    padding: 0 20px 28px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-overlay-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+    row-gap: 24px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-hero-controls,
+  #xbybody .media-server-workspace .detail-hero-main {
+    min-height: 0 !important;
+  }
+
+  #xbybody .media-server-workspace .detail-title-block-brand {
+    min-height: 0;
+  }
+
+  #xbybody .media-server-workspace .detail-actions-column {
+    max-width: 270px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-lower-content {
+    padding: 16px 20px 28px !important;
+  }
+
+  #xbybody .media-server-workspace .detail-file-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #xbybody .media-server-workspace .detail-file-meta {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}
+
+/* Server library root uses landscape collections, not media posters. */
+#xbybody .media-server-workspace.unified-server-root .root-library-fallback { position:absolute;inset:0;display:grid;place-items:center;color:#ff8b25;background:var(--color-fill-2); }
+#xbybody .media-server-workspace.unified-server-root .library-shell { margin:0!important; }
+#xbybody#xbybody .media-server-workspace.unified-server-root .library-shell-list .library-card { width:100%!important;display:flex!important;flex-direction:row!important;align-items:center!important;gap:16px!important; }
+#xbybody#xbybody .media-server-workspace.unified-server-root .library-shell-list .library-cover { width:92px!important;height:138px!important;min-width:92px!important;max-width:92px!important;aspect-ratio:2/3!important; }
+#xbybody#xbybody .media-server-workspace.unified-server-root .library-shell-list .library-card h4 { display:block!important;position:static!important;color:var(--color-text-1)!important;font-size:14px!important; }
+#xbybody .media-server-workspace.unified-server-root .workspace-page { padding:0!important;background:transparent!important; }
+#xbybody .media-server-workspace.unified-server-root .library-card .listing-overlay-badge { display:none!important; }
+#xbybody .media-server-workspace.unified-server-root .library-card-hero { gap:0!important; }
+#xbybody .media-server-workspace.unified-server-root .workspace-content { padding: 0 !important; }
+#xbybody .media-server-workspace.unified-server-root .home-page { padding: 16px !important; }
+#xbybody .media-server-workspace.unified-server-root .library-shell-grid { display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:28px 16px!important;grid-template-columns:repeat(3,minmax(0,1fr))!important; }
+#xbybody .media-server-workspace.unified-server-root .library-card { padding:0!important;border:0!important;background:transparent!important;box-shadow:none!important;min-width:0; }
+#xbybody .media-server-workspace.unified-server-root .library-cover { width:100%;aspect-ratio:16/9!important;height:auto!important;border-radius:16px;background:var(--color-fill-2)!important; }
+#xbybody .media-server-workspace.unified-server-root .listing-overlay-badge { display:none!important; }
+#xbybody .media-server-workspace.unified-server-root .library-card h4 { margin:8px 0 0;font-size:13px;font-weight:600;text-align:left;color:var(--color-text-1)!important; }
+#xbybody .media-server-workspace.unified-server-root .library-shell-list { display:flex;flex-direction:column;gap:0; }
+#xbybody .media-server-workspace.unified-server-root .library-card-list { display:flex!important;flex-direction:row!important;align-items:center;gap:16px;padding:16px!important;border-bottom:1px solid var(--color-border-2)!important;border-radius:0!important; }
+#xbybody .media-server-workspace.unified-server-root .library-card-list .library-cover { width:92px!important;height:138px!important;aspect-ratio:2/3!important;flex-shrink:0;border-radius:8px; }
+#xbybody .media-server-workspace.unified-server-root .library-card-list h4 { margin:0;font-size:14px; }
+.root-library-check { position:absolute;top:8px;right:8px;z-index:3; }
+@media(max-width:900px){#xbybody .media-server-workspace.unified-server-root .library-shell-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+/* Unified category cards share the local media library's plain poster treatment.
+   This must win over PageMain's global glass-panel rules, regardless of CSS load order. */
+#xbybody .media-server-workspace.unified-server-category .workspace-page,
+#xbybody .media-server-workspace.unified-server-category .workspace-content {
+  border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+  background: transparent !important; backdrop-filter: none !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-card {
+  min-width: 0; padding: 0 !important; background: transparent !important;
+  border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+  backdrop-filter: none !important; -webkit-backdrop-filter: none !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-cover {
+  border: 0 !important; border-radius: 12px !important; box-shadow: none !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-card-grid { gap: 0 !important; }
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-card-grid > h4 {
+  margin: 6px 0 3px !important; padding: 0 !important; font-size: 13px !important;
+  font-weight: 600 !important; line-height: 1.4; color: var(--color-text-1) !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-meta-line {
+  margin: 0 !important; padding: 0 !important; font-size: 12px !important;
+  color: var(--color-text-3) !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .listing-overlay-badge { display: none !important; }
+
+ #xbybody .media-server-workspace.unified-server-category .workspace-content { padding: 0 !important; }
+#xbybody .media-server-workspace.unified-server-category .library-list-genres { display: flex; flex-wrap: wrap; gap: 6px; }
+#xbybody .media-server-workspace.unified-server-category .library-list-genres span { padding: 2px 10px; border-radius: 12px; font-size: 12px; color: var(--color-text-2); background: var(--color-fill-2); }
+
+/* List rows follow the media library, independent of the plain grid-card reset. */
+#xbybody .media-server-workspace.unified-server-category .unified-listing.library-shell-list {
+  padding: 0 8px; gap: 0;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-card-list {
+  position: relative; flex-direction: row !important; align-items: center !important;
+  gap: 22px !important; padding: 12px 0 !important; transform: none !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-card-list + .library-card-list::before {
+  content: ''; position: absolute; top: 0; left: 120px; right: 0;
+  border-top: 1px solid var(--color-border-2);
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-card-list .library-cover {
+  width: 98px !important; min-width: 98px !important; height: 147px !important;
+  border-radius: 8px !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-list-body {
+  flex: 1; min-width: 0; max-width: none !important; gap: 4px !important; padding: 0 !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-list-body h4 {
+  font-size: 16px !important; font-weight: 600 !important; line-height: 1.4 !important;
+  color: var(--color-text-1) !important; -webkit-line-clamp: 1;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-list-meta {
+  gap: 20px !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-list-meta-chip {
+  min-height: 0 !important; padding: 0 !important; background: transparent !important;
+  border: 0 !important; border-radius: 0 !important; font-size: 13px !important;
+  font-weight: 400 !important; color: var(--color-text-3) !important;
+}
+#xbybody .media-server-workspace.unified-server-category .unified-listing .library-list-overview {
+  max-width: none !important; font-size: 13px !important; line-height: 1.4 !important;
+  color: var(--color-text-3) !important; -webkit-line-clamp: 2 !important;
+}
+</style>
+
+<style scoped>
+.server-file-download{flex-shrink:0;padding:12px;border:0;background:transparent;color:var(--color-text-2);cursor:pointer}.server-file-download:focus-visible{outline:2px solid #ff8b25}
+#xbybody .media-server-workspace .detail-play-row:not(.has-version) {
+  grid-template-columns: minmax(0, 1fr);
 }
 </style>

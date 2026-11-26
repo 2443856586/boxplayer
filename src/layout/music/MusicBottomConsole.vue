@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { FileText, Heart, List, Pause, Play, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, SlidersHorizontal, Volume2, VolumeX } from 'lucide-vue-next'
+import { FileText, Heart, List, LoaderCircle, Pause, Play, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, SlidersHorizontal, Volume2, VolumeX } from 'lucide-vue-next'
 import SoundEffectBtn from '../../components/SoundEffectBtn.vue'
 import { t as tt } from '../../i18n'
 
@@ -51,7 +51,6 @@ const emit = defineEmits<{
 const qualityOpen = ref(false)
 const statusText = computed(() => {
   if (props.errMsg) return props.errMsg
-  if (props.loading) return tt('common.loading')
   if (props.metaLoad) return tt('music.fetchingLyrics')
   return ''
 })
@@ -80,7 +79,8 @@ const qualityOptions = [
           <div :class="['control-cover', !coverUrl ? 'cover-empty' : '']" :style="coverUrl ? { backgroundImage: `url(${coverUrl})` } : {}"></div>
           <div class="control-meta">
             <div class="control-title" :title="title || tt('music.notPlaying')">{{ title || tt('music.notPlaying') }}</div>
-            <div class="control-artist" :title="artist || album || tt('music.unknownArtist')">
+            <div v-if="statusText" :class="['track-status', { error: !!errMsg }]" :title="statusText" :role="errMsg ? 'alert' : 'status'">{{ statusText }}</div>
+            <div v-else class="control-artist" :title="artist || album || tt('music.unknownArtist')">
               {{ artist || (album || tt('music.unknownArtist')) }}<span v-if="artist && album"> · {{ album }}</span>
             </div>
           </div>
@@ -121,7 +121,13 @@ const qualityOptions = [
         <button class="ctrl-btn" :title="tt('music.nextTrack')" @click="emit('next')">
           <SkipForward :size="22" :stroke-width="1.8" />
         </button>
-        <div id="time-display">{{ displayTime }} / {{ durationText }}</div>
+        <div id="time-display" :class="{ 'is-loading': loading && !errMsg }" :aria-live="loading && !errMsg ? 'polite' : 'off'">
+          <template v-if="loading && !errMsg">
+            <LoaderCircle class="playback-loading-spinner" :size="13" aria-hidden="true" />
+            <span>{{ tt('common.loading') }}</span>
+          </template>
+          <template v-else>{{ displayTime }} / {{ durationText }}</template>
+        </div>
       </div>
 
       <div class="control-cluster modes">
@@ -147,7 +153,6 @@ const qualityOptions = [
       </div>
     </div>
 
-    <div v-if="statusText" :class="['control-status', errMsg ? 'error' : '']" :title="lyricDebugTitle">{{ statusText }}</div>
   </div>
 </template>
 
@@ -453,6 +458,20 @@ const qualityOptions = [
   letter-spacing: .35px;
   text-align: center;
 }
+#time-display.is-loading {
+  gap: 6px;
+  letter-spacing: 0;
+}
+.playback-loading-spinner {
+  flex-shrink: 0;
+  animation: playback-loading-spin 1s linear infinite;
+}
+@keyframes playback-loading-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .playback-loading-spinner { animation: none; }
+}
 .quality-control,
 .volume-control {
   position: relative;
@@ -492,9 +511,9 @@ const qualityOptions = [
   padding: 8px;
   border: 1px solid rgba(157,184,207,.24);
   border-radius: 14px;
-  background: rgba(10,11,14,.82);
+  background: var(--app-overlay-bg);
   box-shadow: 0 18px 48px rgba(0,0,0,.38), inset 0 1px 0 rgba(255,255,255,.08);
-  backdrop-filter: blur(24px) saturate(1.25);
+  backdrop-filter: none;
   opacity: 0;
   pointer-events: none;
   transform: translateX(-50%) translateY(8px);
@@ -588,9 +607,9 @@ const qualityOptions = [
   padding: 0 12px;
   border: 1px solid rgba(255,255,255,.09);
   border-radius: 14px;
-  background: rgba(12,12,16,.78);
+  background: var(--app-overlay-bg);
   box-shadow: 0 18px 48px rgba(0,0,0,.38), inset 0 1px 0 rgba(255,255,255,.07);
-  backdrop-filter: blur(24px) saturate(1.12);
+  backdrop-filter: none;
   opacity: 0;
   pointer-events: none;
   transform: translateX(-50%) translateY(8px);
@@ -623,22 +642,15 @@ const qualityOptions = [
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
-.control-status {
-  position: absolute;
-  z-index: 2;
-  bottom: 8px;
-  left: 50%;
-  width: min(84%, 520px);
+.track-status {
   overflow: hidden;
-  color: rgba(255,255,255,.42);
+  color: rgba(255,255,255,.52);
   font-size: 11px;
-  pointer-events: none;
-  text-align: center;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
-  transform: translateX(-50%);
 }
-.control-status.error {
+.track-status.error {
   color: #ff9aa8;
 }
 @keyframes thumb-particle-a {
@@ -756,7 +768,6 @@ const qualityOptions = [
     font-size: 11px;
   }
   .control-artist,
-  .control-status,
   #time-display,
   .source-control {
     display: none;

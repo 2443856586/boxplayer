@@ -14,11 +14,15 @@ export interface ITokenInfo {
   open_api_refresh_token: string
   open_api_expires_in: number
 
+  cloud189_family_session_key?: string
+  cloud189_family_session_secret?: string
+
   signature: string
   device_id: string
   expires_in: number
   token_type: string
   user_id: string
+  source_name?: string
   user_name: string
 
   avatar: string
@@ -61,12 +65,14 @@ export interface UserState {
   user_id: string
   userLogined: boolean
   userShowLogin: boolean
+  loginFromFileSources: boolean
 }
 
 const useUserStore = defineStore('user', {
   state: (): UserState => ({
     user_id: '',
     userLogined: false,
+    loginFromFileSources: false,
     userShowLogin: false
   }),
 

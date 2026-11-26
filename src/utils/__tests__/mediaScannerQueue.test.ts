@@ -1,5 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as nodePath from 'node:path'
+import { MediaFileNormalizer } from '../mediaFileNormalizer'
+import { MediaPersistenceError } from '../mediaPersistenceSnapshot'
 
 const mediaStore = {
   mediaItems: [] as any[],
@@ -9,14 +11,26 @@ const mediaStore = {
   beginPersistenceBatch: vi.fn(),
   checkpointPersistenceBatch: vi.fn(),
   endPersistenceBatch: vi.fn(),
+  flushPersistence: vi.fn().mockResolvedValue(undefined),
   reconcileFolderSource: vi.fn(),
   removeFolder: vi.fn(),
   setScanning: vi.fn(),
-  setScanProgress: vi.fn()
+  setScanProgress: vi.fn(),
+  addOrMergeTvSeries: vi.fn(),
+  addToRecentlyAdded: vi.fn(),
+  removeMediaItem: vi.fn(),
+  addMediaItem: vi.fn()
 }
 
 const storage = new Map<string, string>()
+const settingStore = {
+  mediaLibrarySubtitleScope: 'same-folder' as const,
+  apiAIMediaScrapeEnabled: false
+}
 const mediaDb = {
+  associateMediaFilesWithFolder: vi.fn().mockResolvedValue([]),
+  getScrapedMediaItem: vi.fn().mockResolvedValue(undefined),
+  getMediaLibraryItemsByIds: vi.fn().mockResolvedValue([]),
   getIndexedMediaFileIds: vi.fn().mockResolvedValue(new Set()),
   getMediaLibraryFolderFileIds: vi.fn().mockResolvedValue([]),
   reconcileMediaLibraryFolder: vi.fn().mockResolvedValue(undefined)
@@ -24,7 +38,7 @@ const mediaDb = {
 
 vi.mock('../../store/medialibrary', () => ({ useMediaLibraryStore: () => mediaStore }))
 vi.mock('../../store', () => ({ usePanTreeStore: () => ({ drive_id: 'quark', user_id: 'quark_user' }) }))
-vi.mock('../../setting/settingstore', () => ({ default: () => ({ mediaLibrarySubtitleScope: 'same-folder' }) }))
+vi.mock('../../setting/settingstore', () => ({ default: () => settingStore }))
 vi.mock('../message', () => ({ default: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() } }))
 vi.mock('../libraryScanRateLimiter', () => ({
   libraryScanRateLimitScope: vi.fn(() => 'test-scope'),
@@ -77,6 +91,7 @@ describe('MediaScanner scan queue', () => {
     storage.clear()
     mediaStore.mediaItems = []
     mediaStore.folders = []
+    settingStore.apiAIMediaScrapeEnabled = false
     mediaDb.getMediaLibraryFolderFileIds.mockResolvedValue([])
   })
 
@@ -148,6 +163,36 @@ describe('MediaScanner scan queue', () => {
     expect(Array.from((scanner as any).getIndexedDriveFileIds()).sort()).toEqual([':::episode-file-id', ':::movie-file-id'])
   })
 
+  it('does not skip cached unmatched records on incremental retry', () => {
+    mediaStore.mediaItems = [{ type: 'unmatched', driveFiles: [{ id: 'unmatched' }] }, { type: 'movie', scrapeRetrying: true, driveFiles: [{ id: 'retry' }] }]
+    expect([...(new MediaScanner() as any).getIndexedDriveFileIds()]).toEqual([])
+  })
+
+  it('associates already indexed files with an overlapping source before skipping them', async () => {
+    const scanner = new MediaScanner()
+    const video = { drive_id: 'quark', file_id: 'video', parent_file_id: 'overlap', name: 'Movie.mkv', isDir: false, size: 1 } as any
+    ;(scanner as any).getFolderItemsWithRetry = vi.fn().mockResolvedValue([video])
+    mediaDb.getIndexedMediaFileIds.mockResolvedValueOnce(new Set(['quark:quark_user:quark:video']))
+    const process = vi.spyOn(scanner as any, 'processVideoFileWithoutAI')
+    await scanner.scanFolder(folder('overlap'), 'quark', { incremental: true, silent: true })
+    expect(mediaDb.associateMediaFilesWithFolder).toHaveBeenCalledWith([expect.objectContaining({ id: 'video' })], 'quark:quark_user:quark:overlap')
+    expect(process).not.toHaveBeenCalled()
+  })
+
+  it('uses explicit TV identity and maps a multi-episode file to every requested episode', async () => {
+    const scanner = new MediaScanner()
+    const episodes = [1, 2].map(number => ({ id: number, episode_number: number, season_number: 1, name: `Episode ${number}` }))
+    const searchTV = vi.fn().mockResolvedValue({ tv: { id: 999, name: 'Resolved TV', genres: [] }, current_season: { id: 1, season_number: 1, episodes } })
+    ;(scanner as any).tmdbService = { normalizeFileName: (name: string, hint: string) => new MediaFileNormalizer().normalize(name, hint), searchTV }
+    const video = { id: 'episode', name: 'Show.tmdb-999.S01E01-E02.mkv', path: '/Show/Show.tmdb-999.S01E01-E02.mkv', driveServerId: 'quark', userId: 'quark_user', driveId: 'quark', fileSize: 1 }
+    await expect((scanner as any).processVideoFileWithoutAI(video, 'Show', 'source')).resolves.toBeNull()
+    expect(searchTV.mock.calls[0][3]).toBe('999')
+    const saved = mediaStore.addOrMergeTvSeries.mock.calls.at(-1)?.[0]
+    expect(saved.id).toBe('tv_999')
+    expect(saved.seasons[0].episodes.map((episode: any) => episode.episodeNumber)).toEqual([1, 2])
+    expect(saved.seasons[0].episodes.every((episode: any) => episode.driveFiles[0].id === 'episode')).toBe(true)
+  })
+
   it('scopes media-source and file keys by provider, account, and drive', () => {
     const scanner = new MediaScanner()
     const first = (scanner as any).getScopedFolderKey({ driveServerId: 'quark', userId: 'quark_a', driveId: 'quark' }, '0')
@@ -187,6 +232,13 @@ describe('MediaScanner scan queue', () => {
     }
   })
 
+  it('aborts reconciliation rather than turning a persistence failure into a successful match', async () => {
+    const scanner = new MediaScanner()
+    vi.spyOn(scanner as any, 'processVideoFileWithoutAI').mockRejectedValue(new MediaPersistenceError(new Error('database unavailable')))
+    await expect((scanner as any).processVideoBatchWithTransientRetry([{ id: 'file' }], 'source', 'source')).rejects.toThrow('database unavailable')
+    expect(mediaDb.reconcileMediaLibraryFolder).not.toHaveBeenCalled()
+  })
+
   it('keeps cloud scan progress below 100 percent until traversal completes', async () => {
     const scanner = new MediaScanner()
     const video = { drive_id: 'quark', file_id: 'video-file', parent_file_id: 'movie-folder', name: 'Movie.2026.mkv', path: '/Movie.2026.mkv', isDir: false, size: 1 } as any
@@ -197,6 +249,34 @@ describe('MediaScanner scan queue', () => {
 
     expect(mediaStore.setScanProgress).toHaveBeenCalledWith(1, 2)
     expect(mediaStore.setScanProgress).toHaveBeenLastCalledWith(1, 1)
+  })
+
+  it('sends unmatched videos to AI only after regular scraping has finished', async () => {
+    settingStore.apiAIMediaScrapeEnabled = true
+    const scanner = new MediaScanner()
+    const rootVideo = { drive_id: 'quark', file_id: 'root-video', parent_file_id: 'root-folder', name: 'Root.Movie.2026.mkv', path: '/Root.Movie.2026.mkv', isDir: false, size: 1 } as any
+    const childFolder = { drive_id: 'quark', file_id: 'child-folder', parent_file_id: 'root-folder', name: 'Child', path: '/Child', isDir: true } as any
+    const childVideo = { drive_id: 'quark', file_id: 'child-video', parent_file_id: 'child-folder', name: 'Child.Movie.2026.mkv', path: '/Child/Child.Movie.2026.mkv', isDir: false, size: 1 } as any
+    const events: string[] = []
+
+    ;(scanner as any).getFolderItemsWithRetry = vi.fn()
+      .mockResolvedValueOnce([rootVideo, childFolder])
+      .mockResolvedValueOnce([childVideo])
+    vi.spyOn(scanner as any, 'canRunInternalAIScrape').mockResolvedValue(true)
+    vi.spyOn(scanner as any, 'processVideoFileWithoutAI').mockImplementation(async (file: any) => {
+      events.push(`tmdb:${file.id}`)
+      return file
+    })
+    const applyAI = vi.spyOn(scanner as any, 'applyBatchAIScrapeResults').mockImplementation(async (...args: unknown[]) => {
+      const files = args[0] as any[]
+      events.push(`ai:${files.map(file => file.id).join(',')}`)
+      return 0
+    })
+
+    await scanner.scanFolder(folder('root-folder'), 'quark', { silent: true })
+
+    expect(events).toEqual(['tmdb:root-video', 'tmdb:child-video', 'ai:root-video,child-video'])
+    expect(applyAI).toHaveBeenCalledTimes(1)
   })
 
   it('uses the shared scrape result pipeline for local video files', async () => {

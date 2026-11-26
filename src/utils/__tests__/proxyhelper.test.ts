@@ -64,6 +64,14 @@ describe('normalizeProxyRangeHeaders', () => {
 })
 
 describe('shouldRefreshProxyUrl', () => {
+  it.each(['Origin', 'FHD'])('keeps subtitle URLs independent of cached video quality %s', (selectQuality) => {
+    expect(shouldRefreshProxyUrl({ proxyKind: 'subtitle', driveId: 'aliyun', fileId: 'subtitle', proxyUrl: 'https://cdn.test/sub.srt', selectQuality,
+      proxyInfo: { file_id: 'other-video', expires_time: 1, videoQuality: 'SD' }
+    })).toBe(false)
+  })
+  it('does not replace an absent subtitle URL with a video URL', () => {
+    expect(shouldRefreshProxyUrl({ proxyKind: 'subtitle', driveId: 'aliyun', fileId: 'video', proxyUrl: '', selectQuality: 'FHD' })).toBe(false)
+  })
   it('does not refresh media server proxy urls through cloud drive APIs', () => {
     expect(shouldRefreshProxyUrl({
       driveId: 'media_server',
@@ -89,5 +97,6 @@ describe('proxy response lifecycle', () => {
     expect(source).toContain("httpResp.on('close', () => {")
     expect(source).toContain('if (!httpResp.complete) finishResponse(true)')
     expect(source).toContain('if (endClient && !clientRes.writableEnded) clientRes.end()')
+    expect(source).toContain("if (proxyUrl.includes('.aliyuncs.com') && !isAuthenticatedMpvProxy)")
   })
 })

@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.js?url'
-import { Sparkles } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, Minus, Plus, Sparkles } from 'lucide-vue-next'
 import DocumentAIModal from '../components/DocumentAIModal.vue'
 import LimitReachedModal from '../setting/LimitReachedModal.vue'
 import { KeyboardState, useAppStore, useKeyboardStore } from '../store'
@@ -24,7 +24,10 @@ const appStore = useAppStore()
 const canvasRef = ref<HTMLCanvasElement>()
 const pageNum = ref(1)
 const pageCount = ref(0)
-const scale = ref(1.15)
+const scale = ref(1)
+const fitToWidth = ref(true)
+const previewRef = ref<HTMLElement>()
+let previewObserver: ResizeObserver | null = null
 const loading = ref(true)
 const errorText = ref('')
 const aiVisible = ref(false)
@@ -39,6 +42,10 @@ const aiFile = computed(() => {
 let pdfDoc: any = null
 let loadingTask: any = null
 let renderTask: any = null
+let renderGeneration = 0
+let renderQueue: Promise<void> = Promise.resolve()
+let disposed = false
+let renderedPage: any = null
 
 const onKeyDown = (event: KeyboardEvent) => {
   const ele = (event.srcElement || event.target) as any
@@ -71,7 +78,13 @@ const handleMaxClick = (_e?: any) => {
   if (window.WebToWindow) window.WebToWindow({ cmd: 'maxsize' })
 }
 
-const renderPage = async () => {
+const renderPage = () => {
+  const generation = ++renderGeneration
+  const requestedPage = pageNum.value
+  const requestedScale = scale.value
+  renderTask?.cancel()
+  renderQueue = renderQueue.catch(() => {}).then(async () => {
+  if (disposed || generation !== renderGeneration) return
   if (!pdfDoc || !canvasRef.value) return
   loading.value = true
   errorText.value = ''
@@ -80,23 +93,38 @@ const renderPage = async () => {
       renderTask.cancel()
       renderTask = null
     }
-    const page = await pdfDoc.getPage(pageNum.value)
-    const viewport = page.getViewport({ scale: scale.value })
+    renderedPage?.cleanup()
+    renderedPage = null
+    const page = await pdfDoc.getPage(requestedPage)
+    if (disposed || generation !== renderGeneration) { page.cleanup(); return }
+    renderedPage = page
+    const naturalViewport = page.getViewport({ scale: 1 })
+    const availableWidth = Math.max(160, (previewRef.value?.clientWidth || 800) - 48)
+    const displayScale = fitToWidth.value ? Math.min(3, availableWidth / naturalViewport.width) : requestedScale
+    if (fitToWidth.value) scale.value = displayScale
+    const viewport = page.getViewport({ scale: displayScale })
+    // Bound raster memory independently of the logical zoom/page dimensions.
+    const rasterScale = Math.min(1, 4096 / Math.max(viewport.width, viewport.height), Math.sqrt(8_000_000 / (viewport.width * viewport.height)))
     const canvas = canvasRef.value
     const context = canvas.getContext('2d')
     if (!context) throw new Error('无法创建 PDF 画布')
-    canvas.width = Math.floor(viewport.width)
-    canvas.height = Math.floor(viewport.height)
-    renderTask = page.render({ canvasContext: context, viewport })
+    canvas.width = Math.max(1, Math.floor(viewport.width * rasterScale))
+    canvas.height = Math.max(1, Math.floor(viewport.height * rasterScale))
+    canvas.style.width = `${viewport.width}px`
+    canvas.style.height = `${viewport.height}px`
+    renderTask = page.render({ canvasContext: context, viewport, transform: rasterScale === 1 ? undefined : [rasterScale, 0, 0, rasterScale, 0, 0] })
     await renderTask.promise
   } catch (err: any) {
-    if (err?.name !== 'RenderingCancelledException') {
+    if (!disposed && generation === renderGeneration && err?.name !== 'RenderingCancelledException') {
       errorText.value = err?.message || 'PDF 渲染失败'
       message.error(errorText.value)
     }
   } finally {
-    loading.value = false
+    renderTask = null
+    if (generation === renderGeneration) loading.value = false
   }
+  })
+  return renderQueue
 }
 
 const loadPdf = async () => {
@@ -112,7 +140,9 @@ const loadPdf = async () => {
     loadingTask = (pdfjsLib as any).getDocument({
       url,
       withCredentials: false,
-      disableStream: false,
+      disableStream: true,
+      disableAutoFetch: true,
+      rangeChunkSize: 256 * 1024,
       disableRange: false
     })
     pdfDoc = await loadingTask.promise
@@ -136,11 +166,15 @@ const nextPage = () => {
 }
 
 const zoomOut = () => {
+  fitToWidth.value = false
   scale.value = Math.max(0.5, Number((scale.value - 0.15).toFixed(2)))
+  renderPage()
 }
 
 const zoomIn = () => {
+  fitToWidth.value = false
   scale.value = Math.min(3, Number((scale.value + 0.15).toFixed(2)))
+  renderPage()
 }
 
 const openDocumentAI = (prompt = '') => {
@@ -157,7 +191,7 @@ const jumpToLocation = (location: string) => {
   if (page > 0 && page <= pageCount.value) pageNum.value = page
 }
 
-watch([pageNum, scale], () => {
+watch(pageNum, () => {
   renderPage()
 })
 
@@ -167,10 +201,15 @@ onMounted(() => {
   setTimeout(() => {
     document.title = name
   }, 1000)
+  previewObserver = new ResizeObserver(() => { if (fitToWidth.value && pdfDoc) renderPage() })
+  if (previewRef.value) previewObserver.observe(previewRef.value)
   loadPdf()
 })
 
 onBeforeUnmount(() => {
+  previewObserver?.disconnect()
+  disposed = true
+  renderGeneration++
   window.removeEventListener('keydown', onKeyDown, true)
   if (renderTask) renderTask.cancel()
   if (loadingTask) loadingTask.destroy()
@@ -184,21 +223,19 @@ onBeforeUnmount(() => {
         <a-button type="text" tabindex="-1">
           <IconFont name="iconfile-pdf" />
         </a-button>
-        <div class="title">{{ appStore.pagePdf?.file_name || 'PDF 预览' }}</div>
+        <div class="title" :title="appStore.pagePdf?.file_name">{{ appStore.pagePdf?.file_name || 'PDF 预览' }}</div>
         <div class="pdf-toolbar q-electron-drag--exception">
-          <a-button type="outline" size="mini" :disabled="pageNum <= 1" @click="prevPage">上一页</a-button>
-          <span class="pdf-page-text">{{ pageNum }} / {{ pageCount || '-' }}</span>
-          <a-button type="outline" size="mini" :disabled="pageNum >= pageCount" @click="nextPage">下一页</a-button>
-          <a-button type="outline" size="mini" @click="zoomOut">-</a-button>
-          <span class="pdf-page-text">{{ Math.round(scale * 100) }}%</span>
-          <a-button type="outline" size="mini" @click="zoomIn">+</a-button>
-          <a-dropdown trigger="hover">
-            <a-button class="pdf-ai-button" type="outline" size="mini"><Sparkles :size="14" /> BoxPlayer AI</a-button>
-            <template #content>
-              <a-doption @click="openDocumentAI('总结这份文档')">总结这份文档</a-doption>
-              <a-doption @click="openDocumentAI()">询问这份文档</a-doption>
-            </template>
-          </a-dropdown>
+          <div class="pdf-toolbar-group" aria-label="翻页控制">
+            <a-button class="pdf-toolbar-button" type="text" size="mini" :disabled="pageNum <= 1" title="上一页" @click="prevPage"><ChevronLeft :size="15" /><span>上一页</span></a-button>
+            <span class="pdf-toolbar-status" :title="`第 ${pageNum} 页，共 ${pageCount || '-'} 页`">{{ pageNum }} <i>/</i> {{ pageCount || '-' }}</span>
+            <a-button class="pdf-toolbar-button" type="text" size="mini" :disabled="pageNum >= pageCount" title="下一页" @click="nextPage"><span>下一页</span><ChevronRight :size="15" /></a-button>
+          </div>
+          <div class="pdf-toolbar-group" aria-label="缩放控制">
+            <a-button class="pdf-toolbar-icon-button" type="text" size="mini" title="缩小" @click="zoomOut"><Minus :size="15" /></a-button>
+            <button class="pdf-fit-button" :class="{ active: fitToWidth }" title="适合宽度" @click="fitToWidth = true; renderPage()">{{ fitToWidth ? '适合宽度' : `${Math.round(scale * 100)}%` }}</button>
+            <a-button class="pdf-toolbar-icon-button" type="text" size="mini" title="放大" @click="zoomIn"><Plus :size="15" /></a-button>
+          </div>
+          <a-button class="pdf-ai-button" type="primary" size="mini" title="打开文档 AI 对话" @click="openDocumentAI()"><Sparkles :size="15" /> <span>AI 问答</span></a-button>
         </div>
         <div class="flexauto"></div>
         <a-button type='text' tabindex='-1' title='最小化 Alt+M' @click='handleMinClick'>
@@ -214,7 +251,7 @@ onBeforeUnmount(() => {
     </a-layout-header>
     <a-layout-content class="pdf-shell__content" style="height: calc(100vh - 42px)">
       <div class="pdf-content">
-      <div class="pdf-preview">
+      <div ref="previewRef" class="pdf-preview">
         <a-spin v-if="loading" class="pdf-loading" :size="32" tip="加载中..." />
         <a-empty v-if="!loading && errorText" class="pdf-error" :description="errorText" />
         <canvas ref="canvasRef" class="pdf-canvas" />
@@ -235,16 +272,78 @@ onBeforeUnmount(() => {
 .pdf-toolbar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-left: 12px;
+  gap: 10px;
+  margin-left: 16px;
+}
+
+.pdf-toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  border: 1px solid var(--color-border-2);
+  border-radius: 8px;
+  background: var(--color-bg-2);
+  overflow: hidden;
+}
+
+.pdf-toolbar-button,
+.pdf-toolbar-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 8px;
+  color: var(--color-text-2);
+  font-size: 12px;
+}
+
+.pdf-toolbar-icon-button {
+  padding: 0;
+}
+
+.pdf-toolbar-button:hover:not(:disabled),
+.pdf-toolbar-icon-button:hover:not(:disabled) {
+  color: rgb(var(--primary-6));
+  background: rgba(var(--primary-6), 0.1);
+}
+
+.pdf-toolbar-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  height: 30px;
+  padding: 0 7px;
+  border-right: 1px solid var(--color-border-2);
+  border-left: 1px solid var(--color-border-2);
+  color: var(--color-text-1);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.pdf-toolbar-status i {
+  margin: 0 4px;
+  color: var(--color-text-4);
+  font-style: normal;
+  font-weight: 400;
+}
+
+.pdf-zoom-status {
+  min-width: 52px;
 }
 
 .pdf-ai-button {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  margin-left: 4px;
-  color: #6558e8;
+  height: 32px;
+  padding: 0 11px;
+  border-radius: 8px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
 }
 
 .pdf-content {
@@ -287,4 +386,25 @@ onBeforeUnmount(() => {
   background: #fff;
   box-shadow: 0 2px 12px rgba(15, 23, 42, 0.18);
 }
+
+/* PageMain 的全局标题栏样式（42px 高、3px 上内边距、37px 行高、按钮 32px/零内边距）都带 !important，这里需用 ID 选择器 + !important 才能覆盖 */
+.pdf-shell #xbyhead2 { display:flex; align-items:center; gap:6px; padding:0 12px; height:52px; line-height:normal; }
+.pdf-shell #xbyhead { height:52px !important; padding:0 !important; line-height:normal !important; border-bottom:1px solid var(--color-border-2); }
+.pdf-shell #xbyhead2 .pdf-toolbar button { height:28px !important; min-height:28px !important; margin:0; line-height:28px !important; }
+.pdf-shell #xbyhead2 .pdf-toolbar-button { min-width:30px !important; padding:0 8px !important; }
+.pdf-shell #xbyhead2 .pdf-toolbar-icon-button { min-width:30px !important; }
+.pdf-shell #xbyhead2 .pdf-fit-button { min-width:72px !important; padding:0 8px !important; border-radius:0; }
+.pdf-shell #xbyhead2 .pdf-ai-button { height:30px !important; min-height:30px !important; padding:0 11px !important; line-height:30px !important; }
+.pdf-shell__content { height:calc(100vh - 52px) !important; }
+.title { min-width:60px; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }
+.pdf-toolbar { margin-left:18px; gap:8px; flex-shrink:0; }
+.pdf-toolbar-group { min-height:28px; border-radius:6px; }
+.pdf-toolbar-status { height:28px; font-size:12px; }
+.pdf-toolbar-button,.pdf-toolbar-icon-button { height:28px; }
+.pdf-fit-button { height:28px; min-width:72px; padding:0 8px; border:0; border-left:1px solid var(--color-border-2); border-right:1px solid var(--color-border-2); background:transparent; color:var(--color-text-2); font:inherit; font-size:12px; cursor:pointer; }
+.pdf-fit-button.active { color:rgb(var(--primary-6)); }
+.pdf-ai-button { height:30px; border-radius:6px; }
+.pdf-preview { background:var(--color-fill-2); }
+.pdf-canvas { margin:24px auto; box-shadow:0 2px 16px rgba(0,0,0,.18); }
+@media (max-width:900px) { .pdf-toolbar-button span { display:none; } .title { max-width:150px; } .pdf-toolbar { margin-left:6px; } }
 </style>

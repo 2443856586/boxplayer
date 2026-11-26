@@ -8,9 +8,15 @@ export interface MediaLibraryItem {
   name: string
   posterUrl?: string
   backdropUrl?: string
+  logoUrl?: string
   year?: string
+  releaseDate?: string
   rating?: number
+  certification?: string
+  mediaSubtype?: 'movie' | 'concert' | 'short'
+  isMiniseries?: boolean
   genres: string[]
+  networks?: Network[]
   productionCountries?: string[]
   overview?: string
   driveFiles: DriveFileItem[]
@@ -29,6 +35,8 @@ export interface MediaLibraryItem {
   lastWatched?: Date
   watchProgress?: number
   lastPlayedFileId?: string
+  lastPlayedPositionSeconds?: number
+  lastPlayedDurationSeconds?: number
   collectionId?: number
   collectionName?: string
   collectionMovies?: MediaCollectionMovie[]
@@ -36,6 +44,7 @@ export interface MediaLibraryItem {
 }
 
 export interface MediaCollectionMovie {
+  certification?: string
   id: string
   parentId: string
   folderId?: string
@@ -44,7 +53,9 @@ export interface MediaCollectionMovie {
   name: string
   posterUrl?: string
   backdropUrl?: string
+  logoUrl?: string
   year?: string
+  releaseDate?: string
   rating?: number
   genres: string[]
   productionCountries?: string[]
@@ -92,6 +103,7 @@ export interface MediaSeason {
 
 export interface MediaEpisode {
   id: number
+  rating?: number
   episodeNumber: number
   name: string
   overview?: string
@@ -137,9 +149,11 @@ export interface TvSeriesItemResponse extends ApiResponse<MediaLibraryTvSeriesIt
 
 // 电影数据结构
 export interface MovieItem {
+  certification?: string
   id: number
   imdb_id?: string
   backdrop_path?: string
+  logo_path?: string
   selfBackdropPath?: string
   backdropFile?: DriveFileItem
   genres?: Genre[]
@@ -169,6 +183,7 @@ export interface MediaLibraryTvSeriesItem {
 }
 
 export interface TvSeriesItem {
+  certification?: string
   id: number
   name: string
   original_name?: string
@@ -177,6 +192,7 @@ export interface TvSeriesItem {
   origin_country?: string[]
   first_air_date?: string
   backdrop_path?: string
+  logo_path?: string
   selfBackdropPath?: string
   backdropFile?: DriveFileItem
   poster_path?: string
@@ -304,6 +320,8 @@ export interface TmdbGenre {
 }
 
 export interface MediaLibraryFolder {
+  isDriveRootFavorite?: boolean
+  isFavorite?: boolean
   id: string // 复合ID: ${driveServerId}_${fileId}
   fileId: string // 真正的阿里云盘文件ID
   name: string

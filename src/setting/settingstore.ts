@@ -230,6 +230,7 @@ export interface SettingState {
   apiAIIndexingMode: 'on-demand' | 'background'
   apiAIReedyEnabled: boolean
   apiAIReedyRuntime: 'mvp' | 'agent'
+  apiAIMediaScrapeEnabled: boolean
   mediaAcquisitionPreferredQuality: 'auto' | '2160p' | '1080p' | '720p' | '480p'
   mediaAcquisitionFetchSubtitles: boolean
   mediaAcquisitionSubtitleLanguage: 'zh-CN' | 'zh-Hant' | 'en' | 'ja' | 'ko' | 'auto'
@@ -286,7 +287,7 @@ const setting: SettingState = {
   uiMediaServerCustomDeviceProfile: DEFAULT_MEDIA_SERVER_CUSTOM_DEVICE_PROFILE,
   uiVideoQualityTips: false,
   uiVideoQualityLastSelect: true,
-  uiVideoPlayer: 'web',
+  uiVideoPlayer: 'mpv',
   uiVideoEnablePlayerList: false,
   uiVideoPlayerExit: false,
   uiVideoPlayerHistory: false,
@@ -454,6 +455,7 @@ const setting: SettingState = {
   apiAIIndexingMode: 'on-demand',
   apiAIReedyEnabled: false,
   apiAIReedyRuntime: 'mvp',
+  apiAIMediaScrapeEnabled: false,
   mediaAcquisitionPreferredQuality: 'auto',
   mediaAcquisitionFetchSubtitles: true,
   mediaAcquisitionSubtitleLanguage: 'zh-CN',
@@ -510,7 +512,7 @@ function _loadSetting(val: any) {
   setting.uiMediaServerCustomDeviceProfile = normalizeMediaServerCustomDeviceProfile(val.uiMediaServerCustomDeviceProfile)
   setting.uiVideoQualityTips = defaultBool(val.uiVideoQualityTips, false)
   setting.uiVideoQualityLastSelect = defaultBool(val.uiVideoQualityLastSelect, true)
-  setting.uiVideoPlayer = defaultValue(val.uiVideoPlayer, ['web', 'mpv', 'other'])
+  setting.uiVideoPlayer = defaultValue(val.uiVideoPlayer, ['mpv', 'web', 'other'])
   setting.uiVideoEnablePlayerList = defaultBool(val.uiVideoEnablePlayerList, false)
   setting.uiVideoPlayerExit = defaultBool(val.uiVideoPlayerExit, false)
   setting.uiVideoPlayerHistory = defaultBool(val.uiVideoPlayerHistory, false)
@@ -693,6 +695,7 @@ function _loadSetting(val: any) {
   setting.apiAIIndexingMode = defaultValue(val.apiAIIndexingMode, ['on-demand', 'background'])
   setting.apiAIReedyEnabled = defaultBool(val.apiAIReedyEnabled, false)
   setting.apiAIReedyRuntime = defaultValue(val.apiAIReedyRuntime, ['mvp', 'agent']) as 'mvp' | 'agent'
+  setting.apiAIMediaScrapeEnabled = defaultBool(val.apiAIMediaScrapeEnabled, false)
   setting.mediaAcquisitionPreferredQuality = defaultValue(val.mediaAcquisitionPreferredQuality, ['auto', '2160p', '1080p', '720p', '480p']) as SettingState['mediaAcquisitionPreferredQuality']
   setting.mediaAcquisitionFetchSubtitles = defaultBool(val.mediaAcquisitionFetchSubtitles, true)
   setting.mediaAcquisitionSubtitleLanguage = defaultValue(val.mediaAcquisitionSubtitleLanguage, ['zh-CN', 'zh-Hant', 'en', 'ja', 'ko', 'auto']) as SettingState['mediaAcquisitionSubtitleLanguage']
@@ -804,6 +807,11 @@ const useSettingStore = defineStore('setting', {
         this.WebSetProxy()
       }
       SaveSetting()
+      if (Object.hasOwn(partial, 'mediaLibrarySubtitleScope')) {
+        const channel = new BroadcastChannel('boxplayer-subtitle-scope')
+        channel.postMessage(this.mediaLibrarySubtitleScope)
+        channel.close()
+      }
       useAppStore().toggleTheme(setting.uiTheme)
       if (Object.hasOwn(partial, 'uiTheme')) window.WebSaveTheme({ theme: setting.uiTheme })
       window.MainProxyHost = setting.debugProxyHost

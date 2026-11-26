@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { KeyboardState, useAppStore, useKeyboardStore } from '../store'
+import useMusicLibraryStore from '../store/musiclibrary'
 import useMusicPlayerStore, { type MusicPlayerState } from '../store/musicplayerstore'
 import message from '../utils/message'
 import { TestAlt, TestKey, TestShift } from '../utils/keyboardhelper'
 import { getRawUrl } from '../utils/proxyhelper'
+import UserDAL from '../user/userdal'
 import useMediaServerRegistryStore from '../store/mediaServerRegistry'
 import { getMediaServerPlaybackInfo } from '../media-server/contentGateway'
 import type { IPageMusicTrack } from '../store/appstore'
 import { fetchMusicMetadata, findActiveLineIndex, parseLrc, type LyricLine, type MusicMetadata } from '../utils/musicMetadata'
-import { bindAudio, ensureInit as initAudioEngine } from '../module/audioplayer/index'
+import { bindAudio, effectSettings, freqs, ensureInit as initAudioEngine } from '../module/audioplayer/index'
 import { shouldHandleMusicPlayerDblClick } from '../utils/pageMusicEvents'
 import { loadMusicTrackList, musicTrackKey, saveMusicTrackList } from '../utils/musicPlayerStorage'
 import { RotateCcw } from 'lucide-vue-next'
@@ -30,15 +32,158 @@ import { DEFAULT_MINERADIO_HOTKEYS, hasHotkeyConflict, hotkeyFromEvent, loadHotk
 import { addTracksToList, createPlaylist, loadPlaylists, savePlaylists, type LocalPlaylist } from '../utils/radio/LocalPlaylistManager'
 import { t } from '../i18n'
 
-const props = defineProps<{ embedded?: boolean; sidePanel?: boolean }>()
+const props = defineProps<{ embedded?: boolean; sidePanel?: boolean; fullPage?: boolean }>()
 const emit = defineEmits<{ (e: 'state-change', state: MusicPlayerState): void }>()
 
 const appStore = useAppStore()
 const keyboardStore = useKeyboardStore()
 const musicPlayerStore = useMusicPlayerStore()
+const continuationLibrary = useMusicLibraryStore()
 const mediaServerRegistry = useMediaServerRegistryStore()
+let musicSessionId = ''
+let usingAudioDecks = false
+const musicAudioCapable = ref(false)
+const automaticContinuation = ref(loadJson('pm.automaticContinuation', false))
+const crossfadeEnabled = ref(loadJson('pm.crossfadeEnabled', false))
+let preparedMusic: { key: string; id: string; owner: string } | null = null
+let preparingMusic = false
+let transitionEpoch = 0
+let attemptedMusicKey = ''
+
+function cancelMusicTransition() {
+  transitionEpoch++
+  preparedMusic = null; preparingMusic = false; attemptedMusicKey = ''
+  if (usingAudioDecks && musicSessionId) void window.WebMusicAudioControl?.({ sessionId: musicSessionId, action: 'cancelTransition' })
+}
+function toggleAutomaticContinuation() {
+  automaticContinuation.value = !automaticContinuation.value
+  saveJson('pm.automaticContinuation', automaticContinuation.value)
+  cancelMusicTransition()
+}
+function toggleMusicCrossfade() {
+  if (!musicAudioCapable.value) return
+  crossfadeEnabled.value = !crossfadeEnabled.value
+  saveJson('pm.crossfadeEnabled', crossfadeEnabled.value)
+  cancelMusicTransition()
+}
+async function appendContinuation(): Promise<boolean> {
+  const owner = musicSessionId, key = currentKey.value, epoch = transitionEpoch
+  if (!continuationLibrary.loaded) await continuationLibrary.loadFromDB()
+  await continuationLibrary.loadAllTracks()
+  if (musicDisposed || owner !== musicSessionId || key !== currentKey.value || epoch !== transitionEpoch || !automaticContinuation.value) return false
+  const keys = new Set(playlist.value.map(musicTrackKey))
+  const current = continuationLibrary.tracks.find(track => musicTrackKey(track) === currentKey.value)
+  const candidates = continuationLibrary.tracks.filter(track => !keys.has(musicTrackKey(track)))
+  const score = (track: typeof candidates[number]) =>
+    (current?.artist && track.artist === current.artist ? 2 : 0) + (current?.album && track.album === current.album ? 1 : 0)
+  candidates.sort((left, right) => score(right) - score(left))
+  if (!candidates.length) return false
+  const next = candidates[0]
+  playlist.value.push({ ...next, password: '', icon: '', thumbnail: next.cover_url || next.thumbnail || '' })
+  return true
+}
+async function prepareMusicTransition() {
+  const key = currentKey.value
+  if (!usingAudioDecks || !crossfadeEnabled.value || !playing.value || dur.value <= 6 || mode.value === 'loop-one'
+    || dur.value - curTime.value > 12 || dur.value - curTime.value <= 0 || preparingMusic || preparedMusic || attemptedMusicKey === key) return
+  attemptedMusicKey = key; preparingMusic = true
+  const epoch = transitionEpoch, owner = musicSessionId
+  try {
+    let index = curIdx.value + 1
+    if (index >= playlist.value.length && automaticContinuation.value) await appendContinuation()
+    if (index >= playlist.value.length) index = mode.value === 'loop-list' ? 0 : -1
+    if (index < 0 || musicTrackKey(playlist.value[index]) === key) return
+    const nextKey = musicTrackKey(playlist.value[index])
+    const source = await resolveUrl(index)
+    if (musicDisposed || epoch !== transitionEpoch || owner !== musicSessionId || !source.url) return
+    const id = crypto.randomUUID()
+    const result = await window.WebMusicAudioLoad({ ...source, sessionId: id, ownerSessionId: owner, prepare: true, audioOnly: true })
+    if (result?.ok && epoch === transitionEpoch && owner === musicSessionId) {
+      preparedMusic = { key: nextKey, id, owner }
+      const filters = freqs.map(frequency => `equalizer=f=${frequency}:t=o:w=1:g=${effectSettings.eq[`hz${frequency}`]}`)
+      if (effectSettings.panner.enabled) filters.push(`apulsator=hz=${Math.max(0.01, Math.min(2, effectSettings.panner.speed / 100))}:amount=1`)
+      await window.WebMusicAudioControl({ sessionId: id, action: 'setVideoProperty', property: 'af', propertyValue: `lavfi=[${filters.join(',')}]` })
+      await window.WebMusicAudioControl({ sessionId: id, action: 'setSpeed', value: effectSettings.pitchShifter.playbackRate })
+    }
+  } catch { /* Leave the current track playing; normal completion can retry its next source. */ }
+  finally { if (epoch === transitionEpoch) preparingMusic = false }
+}
+async function activatePreparedMusic(status: any): Promise<boolean> {
+  const pending = preparedMusic
+  if (!pending || !usingAudioDecks || !crossfadeEnabled.value || !playing.value || !status.preparedReady
+    || status.preparedSessionId !== pending.id || pending.owner !== musicSessionId
+    || dur.value - curTime.value > 3 || mode.value === 'loop-one') return false
+  const nextIndex = playlist.value.findIndex(track => musicTrackKey(track) === pending.key)
+  if (nextIndex < 0) { cancelMusicTransition(); return false }
+  preparedMusic = null
+  const epoch = transitionEpoch
+  const result = await window.WebMusicAudioControl({ sessionId: pending.owner, action: 'activatePrepared', nextSessionId: pending.id })
+  if (!result?.ok || musicDisposed || epoch !== transitionEpoch || musicSessionId !== pending.owner) return false
+  musicSessionId = pending.id; curIdx.value = nextIndex; musicEnded = false
+  curTime.value = 0; dur.value = 0; attemptedMusicKey = ''; lastMetaQueryKey = ''
+  loadLyricTimeOffsetForTrack(curTrack.value)
+  void loadCustomCoverForTrack(curTrack.value)
+  void loadCustomLyricForTrack().then(applied => { if (!applied) void loadMeta() })
+  pushRec(curTrack.value)
+  return true
+}
+
+let musicLoadGeneration = 0
+let musicDisposed = false
+let musicStatusTimer: ReturnType<typeof setTimeout> | undefined
+let musicPollingStarted = false
+let musicEnded = false
+let musicSourceReady = false
+
+async function mpvMusicControl(action: string, value?: number, extra?: Record<string, unknown>) {
+  if (!musicSessionId || musicDisposed) return
+  if (action === 'seek') cancelMusicTransition()
+  const owner = musicSessionId
+  const control = usingAudioDecks ? window.WebMusicAudioControl : window.WebMpvEmbeddedControl
+  const result = await control?.({ action, value, sessionId: owner, ...extra })
+  if (musicDisposed || owner !== musicSessionId) return
+  if (result && !result.ok) { errMsg.value = result.error || t('music.playbackError'); playing.value = false }
+  return result
+}
+
+async function pollMusicStatus() {
+  const owner = musicSessionId
+  try {
+    const result = await (usingAudioDecks ? window.WebMusicAudioStatus?.() : window.WebMpvEmbeddedStatus?.())
+    if (musicDisposed || owner !== musicSessionId) return
+    if (!musicSourceReady) return
+    if (result?.sessionId && result.sessionId !== owner) { playing.value = false; musicSourceReady = false; return }
+    if (result?.ok && result.status) {
+      const status = result.status
+      loading.value = !!status.loading || !!status.buffering
+      playing.value = !!status.playing && !status.paused
+      if (Number.isFinite(status.position)) curTime.value = Math.max(0, status.position)
+      if (Number.isFinite(status.duration)) dur.value = Math.max(0, status.duration)
+      if (usingAudioDecks && !result.transitioning) {
+        void prepareMusicTransition()
+        if (await activatePreparedMusic(result)) return
+      }
+      if (status.ended && !musicEnded) { musicEnded = true; playNext(true) }
+    } else if (result?.error) { errMsg.value = result.error; loading.value = false; playing.value = false }
+  } catch (error: any) {
+    if (!musicDisposed && owner === musicSessionId) { errMsg.value = error?.message || t('music.playbackError'); loading.value = false }
+  } finally {
+    if (!musicDisposed) musicStatusTimer = setTimeout(pollMusicStatus, 250)
+  }
+}
+
+async function applyMpvMusicEffects() {
+  if (!musicSourceReady) return
+  const filters = freqs.map(frequency => `equalizer=f=${frequency}:t=o:w=1:g=${effectSettings.eq[`hz${frequency}`]}`)
+  if (effectSettings.panner.enabled) filters.push(`apulsator=hz=${Math.max(0.01, Math.min(2, effectSettings.panner.speed / 100))}:amount=1`)
+  await mpvMusicControl('setVideoProperty', undefined, { property: 'af', propertyValue: `lavfi=[${filters.join(',')}]` })
+  await mpvMusicControl('setSpeed', effectSettings.pitchShifter.playbackRate)
+}
+
+watch(effectSettings, () => { void applyMpvMusicEffects() }, { deep: true })
 
 keyboardStore.$subscribe((_m: any, state: KeyboardState) => {
+  if (props.sidePanel) return // Embedded playback must not capture the main window's shortcuts.
   if (TestAlt('f4', state.KeyDownEvent, handleHide)) return
   if (TestAlt('m', state.KeyDownEvent, handleMin)) return
   if (TestAlt('enter', state.KeyDownEvent, handleMax)) return
@@ -54,6 +199,7 @@ keyboardStore.$subscribe((_m: any, state: KeyboardState) => {
 })
 
 const onKeyDown = (e: KeyboardEvent) => {
+  if (props.sidePanel && !musicPlayerStore.panelVisible) return
   const el = (e.target || e.srcElement) as any
   if (document.querySelector('.arco-modal-container')) return
   if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return
@@ -103,9 +249,44 @@ const dur = ref(0)
 const vol = ref(0.8)
 const muted = ref(false)
 const mode = ref<PlayMode>('loop-list')
+const queueShuffled = ref(false)
+let originalQueue: IPageMusicTrack[] | null = null
+function toggleQueueShuffle() {
+  cancelMusicTransition()
+  const selected = currentKey.value
+  if (originalQueue) {
+    const remaining = [...playlist.value]
+    const restored = originalQueue.flatMap(track => {
+      const index = remaining.findIndex(candidate => musicTrackKey(candidate) === musicTrackKey(track))
+      return index < 0 ? [] : remaining.splice(index, 1)
+    })
+    playlist.value = [...restored, ...remaining]
+    originalQueue = null
+    queueShuffled.value = false
+  } else {
+    originalQueue = [...playlist.value]
+    const reordered = [...playlist.value]
+    for (let i = reordered.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[reordered[i], reordered[j]] = [reordered[j], reordered[i]]
+    }
+    playlist.value = reordered
+    queueShuffled.value = true
+  }
+  curIdx.value = playlist.value.findIndex(track => musicTrackKey(track) === selected)
+  if (mode.value === 'shuffle') mode.value = 'loop-list'
+}
+function toggleQueueRepeat() {
+  cancelMusicTransition()
+  mode.value = mode.value === 'loop-one' ? 'loop-list' : 'loop-one'
+  saveJson('pm.mode', mode.value)
+}
+
 const showLyrics = ref(false)
 const showPanel = ref(false)
 const showQueue = ref(false)
+const playerRoot = ref<HTMLElement | null>(null)
+let queueBoundsObserver: ResizeObserver | undefined
 const panelTab = ref<PanelTab>('queue')
 const errMsg = ref('')
 const seekPreview = ref<number | null>(null)
@@ -823,22 +1004,33 @@ function pushRec(t: IPageMusicTrack | undefined | null) {
 
 async function resolveUrl(idx: number) {
   const track = playlist.value[idx]
-  if (!track) return ''
-  if (track.local_url) return track.local_url
+  if (!track) return { url: '', headers: {} }
+  if (track.local_url) return { url: track.local_url, headers: {} }
   if (track.media_server_id && track.media_server_item_id) {
     mediaServerRegistry.ensureLoaded()
     const config = mediaServerRegistry.servers.find((server) => server.id === track.media_server_id)
     if (!config) throw new Error(t('music.serverConfigMissing'))
     const playback = await getMediaServerPlaybackInfo(config, track.media_server_item_id, track.media_server_source_id)
-    return playback.url
+    return { url: playback.url, headers: playback.headers || {} }
   }
-  const d = await getRawUrl(track.user_id, track.drive_id, track.file_id, track.encType || '', track.password || '', false, 'audio', '', '', track.tokenfrom)
+  // Library tracks may belong to an account other than the active drive account.
+  // Hydrate that exact account before provider routing; never guess Aliyun.
+  await UserDAL.GetUserTokenFromDB(track.user_id)
+  const token = UserDAL.GetUserToken(track.user_id)
+  const provider = token.tokenfrom !== 'unknown' ? token.tokenfrom : track.tokenfrom
+  const d = await getRawUrl(track.user_id, track.drive_id, track.file_id, track.encType || '', track.password || '', false, 'audio', '', '', provider)
   if (typeof d === 'string') throw new Error(d || t('music.getUrlFailed'))
-  return d.url || ''
+  return { url: d.url || '', headers: d.headers || {} }
 }
 
 async function loadIdx(idx: number, auto = true) {
+  cancelMusicTransition()
   if (!playlist.value.length) return
+  void mpvMusicControl('pause')
+  playing.value = false
+  const generation = ++musicLoadGeneration
+  musicSourceReady = false
+  musicEnded = false
   idx = Math.max(0, Math.min(idx, playlist.value.length - 1))
   curIdx.value = idx
   loadLyricTimeOffsetForTrack(playlist.value[idx])
@@ -856,27 +1048,42 @@ async function loadIdx(idx: number, auto = true) {
   if (!a) return
   try {
     loading.value = true
-    const url = await resolveUrl(idx)
+    const { url, headers } = await resolveUrl(idx)
+    if (musicDisposed || generation !== musicLoadGeneration) return
     if (!url) throw new Error(t('music.noPlaybackUrl'))
-    a.src = url
-    a.load()
-    if (auto) {
-      try {
-        await a.play()
-        playing.value = true
-      } catch {
-        playing.value = false
-      }
-    }
+    a.pause()
+    musicSessionId = crypto.randomUUID()
+    const capability = await window.WebMusicAudioCapability?.()
+    if (musicDisposed || generation !== musicLoadGeneration) return
+    musicAudioCapable.value = capability?.available === true
+    usingAudioDecks = musicAudioCapable.value
+    const load = usingAudioDecks ? window.WebMusicAudioLoad : window.WebMpvEmbeddedLoad
+    const loaded = await load?.({ sessionId: musicSessionId, url, headers, audioOnly: true, title: title.value })
+    if (musicDisposed || generation !== musicLoadGeneration) return
+    if (!loaded?.ok) throw new Error(loaded?.error || t('music.playbackError'))
+    musicSourceReady = true
+    await mpvMusicControl('setVolume', muted.value ? 0 : vol.value * 100)
+    if (musicDisposed || generation !== musicLoadGeneration) return
+    await applyMpvMusicEffects()
+    if (musicDisposed || generation !== musicLoadGeneration) return
+    await mpvMusicControl(auto ? 'play' : 'pause')
+    if (musicDisposed || generation !== musicLoadGeneration) return
+    playing.value = auto
+    if (!musicPollingStarted) { musicPollingStarted = true; void pollMusicStatus() }
   } catch (e: any) {
+    if (musicDisposed || generation !== musicLoadGeneration) return
     errMsg.value = e?.message || String(e)
     message.error(t('music.loadFailed', { message: errMsg.value }))
     playing.value = false
   } finally {
-    loading.value = false
+    if (generation === musicLoadGeneration) loading.value = false
   }
+  if (musicDisposed || generation !== musicLoadGeneration) return
   await loadCustomCoverForTrack(curTrack.value)
-  if (!(await loadCustomLyricForTrack())) loadMeta()
+  if (musicDisposed || generation !== musicLoadGeneration) return
+  const hasCustomLyric = await loadCustomLyricForTrack()
+  if (musicDisposed || generation !== musicLoadGeneration) return
+  if (!hasCustomLyric) loadMeta()
   pushRec(curTrack.value)
 }
 
@@ -905,14 +1112,9 @@ async function loadMeta() {
 }
 
 function togglePlay() {
-  const a = audioRef.value
-  if (!a) return
-  if (!a.src) return loadIdx(curIdx.value, true)
-  if (a.paused) a.play().then(() => playing.value = true).catch(() => playing.value = false)
-  else {
-    a.pause()
-    playing.value = false
-  }
+  if (!musicSourceReady) return loadIdx(curIdx.value, true)
+  void mpvMusicControl(playing.value ? 'pause' : 'play')
+  playing.value = !playing.value
 }
 function playPrev() {
   if (!playlist.value.length) return
@@ -925,9 +1127,14 @@ function playPrev() {
   }
   loadIdx(curIdx.value <= 0 ? playlist.value.length - 1 : curIdx.value - 1, true)
 }
-function playNext(auto = false) {
+async function playNext(auto = false) {
   if (!playlist.value.length) return
+  const owner = musicSessionId, key = currentKey.value
   if (mode.value === 'loop-one' && auto) return loadIdx(curIdx.value, true)
+  if (auto && automaticContinuation.value && curIdx.value === playlist.value.length - 1) {
+    try { await appendContinuation() } catch { /* Retain the selected repeat policy when the library is unavailable. */ }
+    if (musicDisposed || owner !== musicSessionId || key !== currentKey.value) return
+  }
   if (mode.value === 'shuffle') return loadIdx(pickShuffle(), true)
   let n = curIdx.value + 1
   if (n >= playlist.value.length) {
@@ -958,6 +1165,7 @@ function playFrom(t: IPageMusicTrack) {
   loadIdx(i, true)
 }
 function removeQueueAt(index: number) {
+  cancelMusicTransition()
   if (index < 0 || index >= playlist.value.length) return
   const wasCurrent = index === curIdx.value
   playlist.value.splice(index, 1)
@@ -967,6 +1175,8 @@ function removeQueueAt(index: number) {
     dur.value = 0
     playing.value = false
     showQueue.value = false
+    void mpvMusicControl('stop')
+    musicSourceReady = false
     try {
       if (audioRef.value) {
         audioRef.value.pause()
@@ -1025,22 +1235,24 @@ function handleShelfBoundaryScroll(direction: -1 | 1) {
   return false
 }
 function seekRel(d: number) {
-  const a = audioRef.value
-  if (a && dur.value) {
-    const next = Math.max(0, Math.min(dur.value, (a.currentTime || 0) + d))
-    a.currentTime = next
+  if (musicSourceReady && dur.value) {
+    const next = Math.max(0, Math.min(dur.value, curTime.value + d))
+    void mpvMusicControl('seek', next)
     curTime.value = next
     syncAudioClock()
   }
 }
 function seekTo(time: number) {
+  cancelMusicTransition()
   const next = Math.max(0, Math.min(effectiveDur.value || time, time - lyricTimeOffsetSec.value))
-  if (audioRef.value) audioRef.value.currentTime = next
+  void mpvMusicControl('seek', next)
   curTime.value = next
   syncAudioClock()
 }
 function setVol(v: number) {
   vol.value = Math.max(0, Math.min(1, v))
+  if (vol.value > 0) muted.value = false
+  void mpvMusicControl('setVolume', muted.value ? 0 : vol.value * 100)
   if (audioRef.value) {
     audioRef.value.volume = vol.value
     if (vol.value > 0 && muted.value) {
@@ -1053,14 +1265,11 @@ function setVol(v: number) {
 function toggleMute() {
   if (!audioRef.value) return
   muted.value = !muted.value
+  void mpvMusicControl('setVolume', muted.value ? 0 : vol.value * 100)
   audioRef.value.muted = muted.value
 }
-function cycleMode() {
-  const o: PlayMode[] = ['loop-list', 'loop-one', 'shuffle', 'list']
-  mode.value = o[(o.indexOf(mode.value) + 1) % o.length]
-  shuffleHist.value = []
-  saveJson('pm.mode', mode.value)
-}
+function cycleMode() { toggleQueueRepeat() }
+
 function toggleLyrics() {
   showLyrics.value = !showLyrics.value
   nextTick(() => {
@@ -1080,7 +1289,7 @@ function onProgDown(e: MouseEvent) {
     window.removeEventListener('mousemove', mv)
     window.removeEventListener('mouseup', up)
     if (audioRef.value && seekPreview.value != null) {
-      audioRef.value.currentTime = seekPreview.value
+      void mpvMusicControl('seek', seekPreview.value)
       curTime.value = seekPreview.value
       syncAudioClock()
     }
@@ -1104,7 +1313,9 @@ function onVolDown(e: MouseEvent) {
   window.addEventListener('mouseup', up)
 }
 function handleHide() {
+  if (props.sidePanel) { musicPlayerStore.hidePanel(); return }
   try { audioRef.value?.pause() } catch {}
+  void mpvMusicControl('stop')
   window.WebToWindow?.({ cmd: 'close' })
   if (!window.WebToWindow) window.close()
 }
@@ -1114,6 +1325,7 @@ function handleRootDblClick(e: MouseEvent) {
   if (shouldHandleMusicPlayerDblClick(e)) handleMax()
 }
 function syncAudioClock() {
+  if (musicSessionId) return
   const a = audioRef.value
   if (!a) return
   const nextTime = Number.isFinite(a.currentTime) ? a.currentTime : 0
@@ -1166,7 +1378,9 @@ function emitState() {
     currentTime: displayTimeSec.value,
     duration: dur.value,
     progressPercent: progPct.value,
-    hasTrack: !!curTrack.value
+    hasTrack: !!curTrack.value,
+    volume: vol.value,
+    mode: mode.value
   })
 }
 
@@ -1180,6 +1394,19 @@ function loadPageMusic(d: any) {
 }
 
 onMounted(() => {
+  void window.WebMusicAudioCapability?.().then(result => { musicAudioCapable.value = result?.available === true }).catch(() => {})
+  const root = playerRoot.value
+  const console = root?.querySelector<HTMLElement>('.bottom-bar')
+  if (root && console) {
+    const updateQueueBounds = () => {
+      const bottom = root.getBoundingClientRect().bottom - console.getBoundingClientRect().top + 12
+      root.style.setProperty('--music-queue-bottom', `${Math.max(12, bottom)}px`)
+    }
+    queueBoundsObserver = new ResizeObserver(updateQueueBounds)
+    queueBoundsObserver.observe(root)
+    queueBoundsObserver.observe(console)
+    updateQueueBounds()
+  }
   window.addEventListener('keydown', onKeyDown, true)
   vol.value = loadJson('pm.vol', 0.8)
   mode.value = (loadJson('pm.mode', 'loop-list') as PlayMode) || 'loop-list'
@@ -1220,7 +1447,10 @@ onMounted(() => {
     bindAudio(audioRef.value)
     initAudioEngine()
   }
-  if (props.sidePanel) return
+  if (props.sidePanel) {
+    if (musicPlayerStore.pendingLoad) loadPageMusic(musicPlayerStore.pendingLoad)
+    return
+  }
   if (visualFx.value.splashEnabled) {
     showSplash.value = true
     window.setTimeout(() => showSplash.value = false, 2100)
@@ -1234,13 +1464,20 @@ onMounted(() => {
   loadPageMusic(d)
 })
 
-watch(curTrack, (t) => { if (t) document.title = t.file_name })
-watch([curTrack, playing, loading, curTime, dur, coverUrl, artist, album, progPct, displayTimeSec], emitState, { immediate: true })
+watch(curTrack, (t) => { if (t && !props.sidePanel) document.title = t.file_name })
+watch(() => [appStore.appTab, appStore.mediaLibrarySection], () => {
+  if (props.sidePanel && (appStore.appTab !== 'media' || appStore.mediaLibrarySection !== 'music')) showQueue.value = false
+})
+watch([curTrack, playing, loading, curTime, dur, coverUrl, artist, album, progPct, displayTimeSec, vol, mode], emitState, { immediate: true })
 watch(() => musicPlayerStore.commandSeq, () => {
   if (!props.sidePanel) return
   if (musicPlayerStore.command === 'toggle') togglePlay()
   else if (musicPlayerStore.command === 'prev') playPrev()
   else if (musicPlayerStore.command === 'next') playNext(false)
+  else if (musicPlayerStore.command === 'seek') seekTo(musicPlayerStore.commandValue)
+  else if (musicPlayerStore.command === 'volume') setVol(musicPlayerStore.commandValue)
+  else if (musicPlayerStore.command === 'mode') cycleMode()
+  else if (musicPlayerStore.command === 'queue') showQueue.value = !showQueue.value
 })
 watch(() => musicPlayerStore.loadSeq, () => {
   if (!props.sidePanel) return
@@ -1285,6 +1522,12 @@ watch(() => visualFx.value.liveBackgroundKeep, () => {
 })
 
 onBeforeUnmount(() => {
+  cancelMusicTransition()
+  queueBoundsObserver?.disconnect()
+  void mpvMusicControl('stop')
+  musicDisposed = true
+  musicLoadGeneration++
+  if (musicStatusTimer) clearTimeout(musicStatusTimer)
   window.removeEventListener('keydown', onKeyDown, true)
   stopClockLoop()
   if (beatChipTimer) window.clearTimeout(beatChipTimer)
@@ -1301,7 +1544,8 @@ defineExpose({ togglePlay, playPrev, playNext, seekRel })
 
 <template>
   <div
-    :class="['mineradio-player', props.embedded ? 'embedded' : '', props.sidePanel ? 'side-panel' : '', immersiveMode ? 'immersive' : '', diySimpleMode ? 'simple-mode' : '', controlsVisible ? 'controls-visible' : 'controls-hidden']"
+    ref="playerRoot"
+    :class="['mineradio-player', props.embedded ? 'embedded' : '', props.sidePanel && !props.fullPage ? 'side-panel' : '', immersiveMode ? 'immersive' : '', diySimpleMode ? 'simple-mode' : '', controlsVisible ? 'controls-visible' : 'controls-hidden']"
     :style="{ '--mineradio-glass-chromatic': String(visualFx.glassChromaticOffset) }"
     @dblclick="handleRootDblClick"
     @mousemove="markControlsVisible"
@@ -1344,7 +1588,7 @@ defineExpose({ togglePlay, playPrev, playNext, seekRel })
       :lyric-debug-title="lyricDebugTitle"
       :lyric-lines="lyricLines"
       :meta-load="metaLoad"
-      :audio-el="audioRef"
+      :audio-el="null"
       :beat-map="beatMap"
       :playing="playing"
       :show-lyrics="showLyrics"
@@ -1732,6 +1976,15 @@ defineExpose({ togglePlay, playPrev, playNext, seekRel })
     </div>
 
     <MusicQueuePanel
+      :automatic-continuation="automaticContinuation"
+      :crossfade="crossfadeEnabled && musicAudioCapable"
+      :crossfade-available="musicAudioCapable"
+      @automatic-continuation="toggleAutomaticContinuation"
+      @crossfade="toggleMusicCrossfade"
+      :shuffled="queueShuffled"
+      :repeat-one="mode === 'loop-one'"
+      @shuffle="toggleQueueShuffle"
+      @repeat="toggleQueueRepeat"
       v-model:filter="listFilter"
       v-model:panel-tab="panelTab"
       :current-key="currentKey"
@@ -1749,14 +2002,26 @@ defineExpose({ togglePlay, playPrev, playNext, seekRel })
       @toggle-fav="toggleFav"
     />
 
+    <Teleport to="body" :disabled="!props.sidePanel || musicPlayerStore.panelVisible">
     <MusicMiniQueue
+      :shuffled="queueShuffled"
+      :repeat-one="mode === 'loop-one'"
+      :automatic-continuation="automaticContinuation"
+      :crossfade="crossfadeEnabled"
+      :crossfade-available="musicAudioCapable"
+      @shuffle="toggleQueueShuffle"
+      @repeat="toggleQueueRepeat"
+      @automatic-continuation="toggleAutomaticContinuation"
+      @crossfade="toggleMusicCrossfade"
+      :class="{ 'library-queue-drawer': props.sidePanel && !musicPlayerStore.panelVisible }"
       :current-index="curIdx"
       :tracks="playlist"
       :visible="showQueue"
       @close="showQueue = false"
-      @play="(idx) => { showQueue = false; loadIdx(idx, true) }"
+      @play="(idx) => { showQueue = false; loadIdx(idx, true); if (props.sidePanel) musicPlayerStore.showPanel() }"
       @remove="removeQueueAt"
     />
+    </Teleport>
 
     <MusicBottomConsole
       :album="album"
@@ -2719,9 +2984,7 @@ body:not([arco-theme='dark']) .mineradio-player {
   width: min(460px, calc(100vw - 42px));
   border: 1px solid rgba(0,245,212,.18);
   border-radius: 22px;
-  background:
-    radial-gradient(circle at 0% 0%, rgba(0,245,212,.12), transparent 44%),
-    linear-gradient(145deg, rgba(18,22,28,.88), rgba(5,6,9,.94));
+  background: var(--app-overlay-bg);
   box-shadow: 0 34px 110px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.10);
   color: var(--music-stage-text);
   overflow: hidden;
@@ -3174,7 +3437,7 @@ body:not([arco-theme='dark']) .mineradio-player {
   border: 1px solid rgba(0,245,212,.16);
   border-radius: 20px;
   color: var(--music-stage-text);
-  background: linear-gradient(145deg, rgba(14,16,20,.92), rgba(5,6,8,.96));
+  background: var(--app-overlay-bg);
   box-shadow: 0 28px 90px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.08);
 }
 .music-detail-head {
@@ -3256,7 +3519,7 @@ body:not([arco-theme='dark']) .mineradio-player {
   }
   .music-detail-modal {
     border-color: rgba(255,255,255,.58);
-    background: rgba(242,248,250,.82);
+    background: var(--app-overlay-bg);
     box-shadow: 0 24px 72px rgba(55,78,94,.20), inset 0 1px 0 rgba(255,255,255,.74);
   }
   .music-fx-reset,

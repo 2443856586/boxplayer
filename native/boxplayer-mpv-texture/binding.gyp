@@ -8,6 +8,7 @@
         "<!@(node -p \"require('node-addon-api').include\")"
       ],
       "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+      "variables": { "enable_libmpv%": "false", "mac_libmpv_dir%": "deps/mpv/macos" },
 
       "conditions": [
         # ── macOS: build the real native addon (IOSurface GPU texture sharing) ──
@@ -21,7 +22,7 @@
             "deps/mpv/include"
           ],
           "libraries": [
-            "-L<(module_root_dir)/deps/mpv/macos",
+            "-L<(module_root_dir)/<(mac_libmpv_dir)",
             "-lmpv",
             "-framework OpenGL",
             "-framework IOSurface",
@@ -38,21 +39,59 @@
           "copies": [
             {
               "destination": "<(module_root_dir)/build/Release",
-              "files": ["<(module_root_dir)/deps/mpv/macos/libmpv.dylib"]
+              "files": ["<(module_root_dir)/<(mac_libmpv_dir)/libmpv.dylib"]
             }
           ]
         }],
 
-        # ── Non-macOS: build a no-op stub (see src/native/stub.cpp for details) ──
-        # Windows uses external mpv via --wid flag, Linux uses separate window.
-        # The stub lets node-gyp and @electron/rebuild succeed without requiring
-        # mpv dev libraries on platforms that don't use the native addon.
-        ["OS!='mac'", {
+        # Default packaging remains a stub until a matching libmpv SDK and
+        # runtime bundle are staged for the target architecture.
+        ["OS!='mac' and enable_libmpv!='true'", {
           "sources": [
             "src/native/stub.cpp"
           ]
+        }],
+        ["OS=='win' and enable_libmpv=='true'", {
+          "sources": [
+            "src/native/addon.cpp",
+            "src/native/mpv_context.cpp",
+            "src/native/win32/dxgi_texture.cpp"
+          ],
+          "include_dirs": ["deps/mpv/include"],
+          "libraries": [
+            "<(module_root_dir)/deps/mpv/win32/<(target_arch)/mpv.lib",
+            "opengl32.lib", "d3d11.lib", "dxgi.lib"
+          ],
+          "msvs_settings": {
+            "VCCLCompilerTool": { "AdditionalOptions": ["/std:c++17"] }
+          }
+        }],
+        ["OS=='linux' and enable_libmpv=='true'", {
+          "sources": [
+            "src/native/addon.cpp",
+            "src/native/mpv_context.cpp",
+            "src/native/linux/dmabuf_texture.cpp"
+          ],
+          "include_dirs": ["deps/mpv/include"],
+          "libraries": [
+            "-L<(module_root_dir)/deps/mpv/linux/<(target_arch)",
+            "-lmpv", "-lEGL", "-lGL"
+          ],
+          "ldflags": ["-Wl,-rpath,\\$$ORIGIN"],
+          "cflags_cc": ["-std=c++17"]
         }]
       ]
+    },
+    {
+      "target_name": "mpv_transport",
+      "type": "none",
+      "conditions": [["OS=='linux'", {
+        "type": "loadable_module",
+        "sources": ["src/native/linux/texture_transport.cpp"],
+        "include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"],
+        "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+        "cflags_cc": ["-std=c++17"]
+      }]]
     }
   ]
 }

@@ -5,13 +5,13 @@ import { describe, expect, it } from 'vitest'
 const readSource = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8')
 
 describe('115 subtitle playback', () => {
-  it('routes every authenticated MPV quality through the MPV-only proxy without changing web playback', () => {
+  it('passes ordinary authenticated URLs directly to MPV while retaining Quark and encrypted proxies', () => {
     const source = readSource('src/layout/PageVideo.vue')
 
-    expect(source).toContain('const useAuthenticatedMpvProxy = !pageVideo.encType && hasPlaybackHeaders(defaultHeaders)')
-    expect(source).toContain("useAuthenticatedMpvProxy ? 'mpv' : ''")
+    expect(source).toContain('const transport = resolveMpvPlaybackTransport(provider, Boolean(pageVideo.encType))')
+    expect(source).toContain('? resolveHeaderAwareVideoUrl(defaultQuality.url, defaultHeaders, data.size, defaultQuality.quality || \'\', transport.proxyKind)')
+    expect(source).toContain(': defaultQuality.url')
     expect(source).toContain("const resolveRawMpvQualitySource = (data: IRawUrl")
-    expect(source).toContain("const defaultUrl = resolveHeaderAwareVideoUrl(defaultQuality.url, defaultHeaders, data.size, defaultQuality.quality || '', useAuthenticatedMpvProxy")
     expect(source).toContain('const mpvHeaders = defaultUrl === defaultQuality.url ? defaultHeaders : undefined')
     expect(source).toContain('headers: mpvHeaders')
     expect(source).toContain("const defaultUrl = resolveHeaderAwareVideoUrl(defaultQuality.url, defaultHeaders, data.size, defaultQuality.quality || '')")
@@ -80,7 +80,7 @@ describe('115 subtitle playback', () => {
     const source = readSource('src/layout/PageVideo.vue')
 
     expect(source).toContain('const getSubtitleFileList = async (includeSubfolders = false)')
-    expect(source).toContain('if (includeSubfolders) {')
+    expect(source).toContain('discoverSubtitleFiles(parentId, includeSubfolders,')
     expect(source).toContain('const getSubTitleList = async (art: Artplayer, autoLoad = true)')
     expect(source).toContain("useSettingStore().mediaLibrarySubtitleScope === 'include-subfolders'")
     expect(source).not.toContain('subTitleListMode')
@@ -93,6 +93,7 @@ describe('115 subtitle playback', () => {
     expect(source).toContain("name: 'subtitleListControl'")
     expect(source).toContain("position: 'right'")
     expect(source).toContain('selector: subSelector')
+    expect(source).not.toContain("html: t('video.singleSubtitle')")
   })
 
   it('uses the shared 115 user-agent when the subtitle proxy requests upstream data', () => {
@@ -102,7 +103,8 @@ describe('115 subtitle playback', () => {
     expect(playerSource).toContain('const userId = item.user_id || pageVideo.user_id')
     expect(playerSource).toContain('await DriveFile.ApiFileDownloadUrl(userId, driveId, item.file_id, 14400, tokenfrom)')
     expect(playerSource).toContain("proxy_kind: 'subtitle'")
-    expect(playerSource).toContain('proxy_headers: hasPlaybackHeaders(data.headers) ? JSON.stringify(data.headers) : undefined')
+    expect(playerSource).toContain('const playbackHeaders = useMacEmbeddedMpv ? mergeMpvPlaybackHeaders(provider, data.headers) : data.headers')
+    expect(playerSource).toContain('proxy_headers: hasPlaybackHeaders(playbackHeaders) ? JSON.stringify(playbackHeaders) : undefined')
     expect(playerSource).not.toContain('const data = await AliFile.ApiFileDownText(pageVideo.user_id, pageVideo.drive_id, item.file_id')
     expect(source).toContain("import { DRIVE115_DOWN_AGENT } from '@shared/drive115'")
     expect(source).toContain("upstreamHeaders['user-agent'] = DRIVE115_DOWN_AGENT")

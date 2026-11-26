@@ -1,5 +1,5 @@
 <template>
-  <div class="media-library-view">
+  <div class="media-library-view" :class="{ 'unified-folder-view': props.unifiedFiles }">
     <div class="media-library-shell">
       <!-- 左侧导航 -->
       <div v-show="props.navVisible ?? true" class="library-sidebar">
@@ -19,6 +19,18 @@
       <div class="media-library-pane">
         <MediaLibrary
           ref="mediaLibrary"
+          :custom-series-detail="props.customSeriesDetail"
+          @open-custom-series-member="emit('openCustomSeriesMember', $event)"
+          :unified-files="props.unifiedFiles"
+          :folder-descending="props.folderDescending"
+          @detailVisibilityChange="emit('detailVisibilityChange', $event)"
+          @tagTitleChange="emit('tagTitleChange', $event)"
+          :unifiedBrowse="props.unifiedBrowse"
+          :browseMode="props.browseMode"
+          :localOnly="props.localOnly"
+          :browseSort="props.browseSort"
+          :browse-sort-descending="props.browseSortDescending"
+          :browseSelection="props.browseSelection"
           :activeCategory="activeCategory"
           :selectedFolder="selectedFolder"
           :selectedGenre="selectedGenre"
@@ -72,7 +84,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { compareMediaBrowseValues, nextMediaBrowseSort, type MediaBrowseSort } from '../utils/mediaBrowseSort'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import MediaLibraryNav from '../components/MediaLibraryNav.vue'
 import MediaLibrary from '../components/MediaLibrary.vue'
 import { useMediaLibraryStore } from '../store/medialibrary'
@@ -81,6 +94,8 @@ import { MediaScanner } from '../utils/mediaScanner'
 import UserDAL from '../user/userdal'
 import message from '../utils/message'
 import type { MediaLibraryFolder } from '../types/media'
+import type { CustomSeriesDetail, SeriesMedia } from '../utils/customMediaSeries'
+import type { IAliGetFileModel } from '../aliapi/alimodels'
 import { isAliyunUser, isBaiduUser, isBoxUser, isCloud123User, isDrive115User, isDropboxUser, isGoogleUser, isOneDriveUser, isPikPakUser, isQuarkUser } from '../aliapi/utils'
 import AliDirFileList from '../aliapi/dirfilelist'
 import { apiBaiduFileList, mapBaiduFileToAliModel } from '../cloudbaidu/dirfilelist'
@@ -95,14 +110,25 @@ const mediaNav = ref()
 const mediaLibrary = ref()
 
 // Props
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   navVisible?: boolean
-}>()
+  unifiedBrowse?: boolean
+  unifiedFiles?: boolean
+  folderDescending?: boolean
+  browseMode?: 'grid' | 'list'
+  localOnly?: boolean
+  browseSort?: MediaBrowseSort
+  browseSortDescending?: boolean
+  browseSelection?: boolean
+  customSeriesDetail?: CustomSeriesDetail
+}>(), { browseSortDescending: undefined })
+const emit = defineEmits<{ openCustomSeriesMember: [member: SeriesMedia]; tagTitleChange: [title: string]; detailVisibilityChange: [visible: boolean]; browseContextChange: [context: { folderId: string; category: string }] }>()
 
 // 状态
 const showScanProgress = ref(false)
-const activeCategory = ref('home')
+const activeCategory = ref('all')
 const selectedFolder = ref<MediaLibraryFolder>()
+watch([selectedFolder, activeCategory], () => emit('browseContextChange', { folderId: selectedFolder.value?.id || '', category: activeCategory.value }))
 const selectedGenre = ref('')
 const selectedYear = ref('')
 const selectedRating = ref('')
@@ -177,6 +203,16 @@ const handleFolderSelected = async (folder: MediaLibraryFolder) => {
   await loadFolderContent(folder)
 }
 
+const selectDriveRoots = (name: string, id: string, userId: string, drives: IAliGetFileModel[]) => {
+  homeNavigationActive.value = false
+  const folder: MediaLibraryFolder = { id, fileId: 'root', name, path: '/', userId,
+    driveId: 'aliyun', driveServerId: 'aliyun', scanDate: new Date(), itemCount: drives.length }
+  selectedFolder.value = folder
+  activeCategory.value = ''
+  resetDrillDownFilters()
+  mediaLibrary.value?.showRootFolderFiles(drives, folder)
+}
+
 // 加载文件夹内容 - 直接显示文件列表
 const loadFolderContent = async (folder: MediaLibraryFolder) => {
   try {
@@ -227,11 +263,9 @@ const loadFolderContent = async (folder: MediaLibraryFolder) => {
       }
     }
 
-    mediaStore.addFolder({
-      ...folder,
-      userId,
-      driveId
-    })
+    if (!folder.id.startsWith('account:') && !folder.id.startsWith('webdav:')) {
+      mediaStore.addFolder({ ...folder, userId, driveId })
+    }
 
     console.warn('[MediaLibraryDebug] loadFolderContent context', {
       folderId: folder.id,
@@ -277,6 +311,18 @@ const loadFolderContent = async (folder: MediaLibraryFolder) => {
       const { items: list } = await apiPikPakFileList(userId, parentId, 100)
       items = list.map((item) => { const mapped = mapPikPakFileToAliModel(item, driveId, parentId); (mapped as any).user_id = userId; return mapped })
       console.log('使用PikPak API获取文件列表')
+    } else if (driveId === 'cloud139') {
+      const { apiCloud139FileList, mapCloud139FileToAliModel } = await import('../cloud139/dirfilelist')
+      const list = await apiCloud139FileList(userId, fileId, 200)
+      items = list.map(item => ({ ...mapCloud139FileToAliModel(item, driveId, fileId), user_id: userId }))
+    } else if (driveId === 'cloud189') {
+      const { listAllCloud189Items } = await import('../cloud189/adapter')
+      const list = await listAllCloud189Items(userId, driveId, fileId)
+      items = list.map(item => ({ ...item, user_id: userId }))
+    } else if (driveId === 'guangya') {
+      const { apiGuangyaFileList, mapGuangyaFileToAliModel } = await import('../guangya/dirfilelist')
+      const list = await apiGuangyaFileList(userId, fileId, 200)
+      items = list.map(item => ({ ...mapGuangyaFileToAliModel(item, driveId, fileId), user_id: userId }))
     } else if (isQuarkUser(userId) || driveId === 'quark') {
       const { apiQuarkFileList, mapQuarkFileToAliModel } = await import('../quark/dirfilelist')
       const parentId = fileId === 'quark_root' ? '0' : fileId
@@ -333,6 +379,8 @@ const loadFolderContent = async (folder: MediaLibraryFolder) => {
       console.log(`文件夹 ${folder.name} 包含 ${items.length} 个项目`)
       // 直接将文件列表传递给 MediaLibrary 组件显示
       mediaLibrary.value?.showFolderFiles(items, folder)
+    } else if (folder.id.startsWith('account:')) {
+      mediaLibrary.value?.showFolderFiles([], folder)
     } else {
       console.log(`文件夹 ${folder.name} 为空或加载失败`)
       message.info('文件夹为空或加载失败')
@@ -436,6 +484,7 @@ const processVideoFileFromApi = async (apiFile: any, folder: MediaLibraryFolder)
 }
 
 const handleCategorySelected = (category: string) => {
+  if (category === 'home') category = 'all'
   homeNavigationActive.value = false
   mediaNav.value?.syncActiveCategory?.(category)
   activeCategory.value = category
@@ -445,6 +494,7 @@ const handleCategorySelected = (category: string) => {
 }
 
 const handleHomeNavigateCategory = (category: string) => {
+  if (category === 'home') category = 'all'
   homeNavigationActive.value = true
   mediaNav.value?.syncActiveCategory?.(category)
   activeCategory.value = category
@@ -528,7 +578,7 @@ const handleCategoryDrillBack = (data: { categoryType: string }) => {
       activeCategory.value = 'ratings'
       break
     default:
-      activeCategory.value = 'home'
+      activeCategory.value = 'all'
       break
   }
 }
@@ -546,8 +596,8 @@ const handleHomeNavigationBack = () => {
   homeNavigationActive.value = false
   selectedFolder.value = undefined
   resetDrillDownFilters()
-  activeCategory.value = 'home'
-  mediaNav.value?.syncActiveCategory?.('home')
+  activeCategory.value = 'all'
+  mediaNav.value?.syncActiveCategory?.('all')
 }
 
 
@@ -644,11 +694,30 @@ onUnmounted(() => {
 
 // 暴露方法给父组件
 defineExpose({
-  addFolderToLibrary
+  resumeMedia: (item: import('../types/media').MediaLibraryItem) => mediaLibrary.value?.resumeMedia(item),
+  returnToTagDetail: () => mediaLibrary.value?.returnToTagDetail() || false,
+  playItems: (items: import('../types/media').MediaLibraryItem[], mode: 'play' | 'loop' | 'shuffle', title: string) => mediaLibrary.value?.playItems(items, mode, title),
+  refreshMetadata: () => mediaLibrary.value?.refreshMetadata(),
+  posterAction: (item: import('../types/media').MediaLibraryItem, action: import('../utils/mediaPosterMenu').PosterAction) => mediaLibrary.value?.posterAction(item, action),
+  folderTitle: computed(() => mediaLibrary.value?.folderTitle || selectedFolder.value?.name || ''),
+  goFolderBack: () => mediaLibrary.value?.goFolderBack(),
+  activeCategory,
+  playFolder: (id: string, mode: 'play' | 'loop' | 'shuffle') => mediaLibrary.value?.playBrowse(mode, id),
+  playBrowse: (mode: 'play' | 'loop' | 'shuffle') => mediaLibrary.value?.playBrowse(mode),
+  addFolderToLibrary,
+  showAddFolder: () => mediaNav.value?.importLocalFolder(),
+  showLocalDevice: () => mediaNav.value?.showLocalDevice(),
+  removeFolder: (folder: MediaLibraryFolder) => mediaNav.value?.removeFolder(folder),
+  manageLibrary: handleManageLibrary,
+  selectCategory: handleCategorySelected,
+  selectFolder: handleFolderSelected,
+  selectDriveRoots,
+  openItem: (item: import('../types/media').MediaLibraryItem) => mediaLibrary.value?.openMedia(item)
 })
 </script>
 
 <style scoped>
+:global(#xbybody .media-library-view.unified-folder-view .media-library-pane){padding:0!important;border:0!important;border-radius:0!important;box-shadow:none!important;background:transparent!important}
 .media-library-view {
   height: 100%;
   width: 100%;
@@ -690,10 +759,23 @@ defineExpose({
 }
 
 :global(#xbybody .media-library-view .media-library-pane) {
+  height: 100% !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
   transform: none !important;
   contain: none !important;
+}
+
+:global(#xbybody .media-library-view .media-library-pane .media-library),
+:global(#xbybody .media-library-view .media-library-pane .media-detail) {
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
 }
 
 :global(#xbybody .media-library-view .library-sidebar) {
@@ -809,4 +891,8 @@ defineExpose({
     max-width: 218px;
   }
 }
+</style>
+
+<style>
+#xbybody .media-library-pane:has(.local-file-collection){padding:0!important;border:0!important;border-radius:0!important;box-shadow:none!important;background:transparent!important}
 </style>

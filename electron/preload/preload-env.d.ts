@@ -9,6 +9,7 @@ declare namespace NodeJS {
 declare interface Window {
   Electron: any
   platform: any
+  WebStartupLock: (action: 'status' | 'unlock' | 'save' | 'disable', current?: string, next?: string) => Promise<{ ok?: boolean; enabled?: boolean; locked?: boolean }>
   WebIsE2E: boolean
   WebE2EAllowTransfers: boolean
   WebGetPathForFile: (file: File) => string
@@ -32,6 +33,8 @@ declare interface Window {
   WebRelaunchAria: () => Promise<number>
   AutoUpdateGetState: () => Promise<any>
   AutoUpdateCheck: (force?: boolean) => Promise<any>
+  AutoUpdateDownload: () => Promise<any>
+  AutoUpdateAcknowledge: () => Promise<any>
   AutoUpdateInstall: () => Promise<boolean>
   AutoUpdateOnStateChanged: (callback: (state: any) => void) => () => void
   WebSetProgressBar: any
@@ -51,13 +54,21 @@ declare interface Window {
   WebShutDown: any
   WebSetProxy: any
   WebMpvEmbeddedCapability: () => Promise<any>
-  WebMpvEmbeddedLoad: (data: any) => Promise<any>
+  WebMusicAudioCapability: () => Promise<{ available: boolean }>
+    WebMusicAudioLoad: (data: any) => Promise<any>
+    WebMusicAudioControl: (data: any) => Promise<any>
+    WebMusicAudioStatus: () => Promise<any>
+    WebMpvEmbeddedLoad: (data: any) => Promise<any>
   WebMpvEmbeddedControl: (data: any) => Promise<any>
   WebMpvEmbeddedStatus: () => Promise<any>
   WebMpvSharedTextureCapability: () => { available: boolean; platform: string; reason?: string }
   WebMpvSharedTexture: {
+    onStatus?: (callback: (status: any) => void) => void
+    removeStatusListener?: () => void
     isAvailable: () => boolean
     onFrame: (callback: (videoFrame: VideoFrame, index: number) => void) => void
+    onSoftwareFrame: (callback: (pixels: Uint8Array, width: number, height: number, index: number, transformed?: boolean) => void) => void
+    removeSoftwareFrameListener: () => void
     removeFrameListener: () => void
     onClear: (callback: () => void) => void
     removeClearListener: () => void

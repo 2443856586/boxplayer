@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, watch, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useAppStore } from '../store'
 import SettingPlay from './SettingPlay.vue'
+import SettingGeneral from './SettingGeneral.vue'
+import SettingSeriesVersions from './SettingSeriesVersions.vue'
 import SettingMediaServerPlayback from './SettingMediaServerPlayback.vue'
 import SettingDanmaku from './SettingDanmaku.vue'
 import SettingPan from './SettingPan.vue'
@@ -13,16 +15,24 @@ import SettingUpload from './SettingUpload.vue'
 import SettingAria from './SettingAria.vue'
 import SettingLog from './SettingLog.vue'
 import SettingProxy from './SettingProxy.vue'
-import SettingWebDav from './SettingWebDav.vue'
 import SettingSecurity from './SettingSecurity.vue'
 import SettingDownloadAdvanced from './SettingDownloadAdvanced.vue'
 import SettingAPI from './SettingAPI.vue'
 import { t } from '../i18n'
+import { ExternalLink, Layers } from 'lucide-vue-next'
+import { openExternal } from '../utils/electronhelper'
+import { SETTINGS_FOLLOW_URL, SETTINGS_HELP_URL, buildSettingsSupportMailto } from '../utils/settingsSupportLinks'
+declare const __APP_VERSION__: string
+const supportAppVersion = ref(typeof __APP_VERSION__ === 'undefined' ? '—' : __APP_VERSION__)
+function reportSettingsError() {
+  openExternal(buildSettingsSupportMailto(supportAppVersion.value, navigator.userAgent))
+}
+onMounted(() => { window.WebPlatformSync?.((data: { appVersion?: string }) => { if (data.appVersion) supportAppVersion.value = data.appVersion }) })
 
 const appStore = useAppStore()
 withDefaults(defineProps<{ sidebarVisible?: boolean }>(), { sidebarVisible: true })
 
-let observer: any
+
 
 const hideSetting = computed(() => appStore.appTab !== 'setting')
 const settingSearch = ref('')
@@ -53,9 +63,9 @@ const refreshSettingSearch = async () => {
   }
   const rows = Array.from(document.querySelectorAll<HTMLElement>('#SettingObserver .settingrow'))
   settingSearchResults.value = rows
-    .filter((row) => matchesSettingSearch(row.innerText.replace(/\s+/g, ' '), query))
+    .filter((row) => matchesSettingSearch((row.textContent || '').replace(/\s+/g, ' '), query))
     .slice(0, 20)
-    .map((element) => ({ label: element.innerText.replace(/\s+/g, ' ').trim(), element }))
+    .map((element) => ({ label: (element.textContent || '').replace(/\s+/g, ' ').trim(), element }))
   updateSettingSearchPopupPosition()
 }
 
@@ -70,6 +80,10 @@ const updateSettingSearchPopupPosition = () => {
 }
 
 const locateSettingSearchResult = (result: { element: HTMLElement }) => {
+  const page = result.element.closest<HTMLElement>('.settings-section')?.id
+  if (page) appStore.toggleTabMenu('setting', page)
+  nextTick(() => result.element.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+  // Highlight the selected result after switching pages.
   result.element.scrollIntoView({ behavior: 'smooth', block: 'center' })
   result.element.classList.remove('settings-search-hit')
   window.requestAnimationFrame(() => result.element.classList.add('settings-search-hit'))
@@ -82,72 +96,35 @@ const sectionMeta: Record<string, { title: string }> = {
   SettingAPI: { title: 'settings.ai' },
   SettingSecurity: { title: 'settings.security' },
   SettingPlay: { title: 'settings.player' },
+  SettingGeneral: { title: 'general.generalTitlePage' },
+  SettingSeriesVersions: { title: 'seriesVersions.seriesVersions' },
   SettingMediaServerPlayback: { title: 'nav.mediaServer' },
   SettingDanmaku: { title: 'settings.danmaku' },
   SettingPan: { title: 'settings.pan' },
   SettingDown: { title: 'settings.download' },
   SettingDownloadAdvanced: { title: 'settings.downloadAdvanced' },
   SettingUpload: { title: 'settings.upload' },
-  SettingWebDav: { title: 'settings.webDav' },
   SettingDebug: { title: 'settings.advanced' },
   SettingProxy: { title: 'settings.proxy' },
   SettingAria: { title: 'settings.remoteAria' },
   SettingLog: { title: 'settings.logs' }
 }
 
-onMounted(() => {
-  window.addEventListener('resize', updateSettingSearchPopupPosition)
-  const root = document.getElementById('SettingObserver')
-  if (!root) return
-
-  observer = new IntersectionObserver(
-    (entries) => {
-      if (entries.length > 0 && entries[0].isIntersecting) {
-        appStore.toggleTabSetting('setting', entries[0].target.id)
-      }
-    },
-    {
-      root,
-      threshold: 0.5
-    }
-  )
-
-  const sectionIds = [
-    'SettingUI',
-    'SettingAccount',
-    'SettingSecurity',
-    'SettingPlay',
-    'SettingMediaServerPlayback',
-    'SettingDanmaku',
-    'SettingPan',
-    'SettingDown',
-    'SettingDownloadAdvanced',
-    'SettingUpload',
-    'SettingWebDav',
-    'SettingDebug',
-    'SettingProxy',
-    'SettingAria',
-    'SettingAPI',
-    'SettingLog'
-  ]
-
-  sectionIds.forEach((id) => {
-    const element = document.getElementById(id)
-    if (element instanceof Element) {
-      observer.observe(element)
-    }
-  })
+const activeSettingsPage = computed(() => sectionMeta[appStore.GetAppTabMenu] ? appStore.GetAppTabMenu : 'SettingUI')
+watch(activeSettingsPage, async () => {
+  await nextTick()
+  document.getElementById('SettingObserver')?.scrollTo({ top: 0 })
 })
+onMounted(() => window.addEventListener('resize', updateSettingSearchPopupPosition))
 
 onUnmounted(() => {
-  if (observer) observer.disconnect()
   window.removeEventListener('resize', updateSettingSearchPopupPosition)
 })
 </script>
 
 <template>
   <a-layout class="settings-shell">
-    <a-layout-sider v-show="sidebarVisible" hide-trigger :width="188" class="xbyleft settings-sider single-boundary-sidebar" tabindex="-1" @keydown.tab.prevent="() => true">
+    <a-layout-sider v-show="sidebarVisible" hide-trigger :width="200" class="xbyleft settings-sider single-boundary-sidebar" tabindex="-1" @keydown.tab.prevent="() => true">
       <div class='headdesc settings-side-title'>
         <span class="settings-side-kicker">{{ t('settings.preferences') }}</span>
         <strong>{{ t('settings.center') }}</strong>
@@ -162,11 +139,11 @@ onUnmounted(() => {
           <template #icon><IconFont name="iconui" /></template>
           {{ t('settings.app') }}
         </a-menu-item>
-        <a-menu-item key="SettingAccount">
+        <a-menu-item key="SettingAccount" data-testid="settings-account-menu">
           <template #icon><IconFont name="iconrobot" /></template>
           {{ t('settings.account') }}
         </a-menu-item>
-        <a-menu-item key="SettingAPI">
+        <a-menu-item key="SettingAPI" data-testid="settings-ai-menu">
           <template #icon><IconFont name="iconlock" /></template>
           {{ t('settings.ai') }}
         </a-menu-item>
@@ -178,6 +155,14 @@ onUnmounted(() => {
         <a-menu-item key="SettingPlay">
           <template #icon><IconFont name="iconshipin" /></template>
           {{ t('settings.player') }}
+        </a-menu-item>
+        <a-menu-item key="SettingGeneral">
+          <template #icon><IconFont name="iconsetting" /></template>
+          {{ t('general.generalTitlePage') }}
+        </a-menu-item>
+        <a-menu-item key="SettingSeriesVersions">
+          <template #icon><Layers :size="16" /></template>
+          {{ t('seriesVersions.seriesVersions') }}
         </a-menu-item>
         <a-menu-item key="SettingMediaServerPlayback">
           <template #icon><IconFont name="iconshipin" /></template>
@@ -204,10 +189,6 @@ onUnmounted(() => {
           <template #icon><IconFont name="iconupload" /></template>
           {{ t('settings.upload') }}
         </a-menu-item>
-        <a-menu-item key='SettingWebDav'>
-          <template #icon><IconFont name="iconchuanshu2" /></template>
-          {{ t('settings.webDav') }}
-        </a-menu-item>
         <div class="settings-menu-group">{{ t('settings.group.system') }}</div>
         <a-menu-item key="SettingDebug">
           <template #icon><IconFont name="iconlogoff" /></template>
@@ -226,6 +207,11 @@ onUnmounted(() => {
           {{ t('settings.logs') }}
         </a-menu-item>
       </a-menu>
+      <div class="settings-support-links">
+        <button type="button" @click="openExternal(SETTINGS_FOLLOW_URL)"><span>{{ t('supportLinks.supportFollow') }}</span><ExternalLink :size="14" /></button>
+        <button type="button" @click="openExternal(SETTINGS_HELP_URL)"><span>{{ t('supportLinks.supportHelpCenter') }}</span><ExternalLink :size="14" /></button>
+        <button type="button" @click="reportSettingsError"><span>{{ t('supportLinks.supportReportError') }}</span><ExternalLink :size="14" /></button>
+      </div>
     </a-layout-sider>
     <Teleport to="body">
       <div v-if="settingSearch.trim()" class="settings-search-results settings-search-results-popup" :style="settingSearchPopupStyle">
@@ -247,22 +233,23 @@ onUnmounted(() => {
 <!--          </div>-->
 <!--        </div>-->
 
-        <section id="SettingUI" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingUI.title as Parameters<typeof t>[0]) }}</h2></div><SettingUI /></section>
-<!--        <section id="SettingAccount" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingAccount.title as Parameters<typeof t>[0]) }}</h2></div><SettingAccount /></section>-->
-        <section id="SettingAPI" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingAPI.title as Parameters<typeof t>[0]) }}</h2></div><SettingAPI /></section>
-        <section id="SettingSecurity" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingSecurity.title as Parameters<typeof t>[0]) }}</h2></div><SettingSecurity /></section>
-        <section id="SettingPlay" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingPlay.title as Parameters<typeof t>[0]) }}</h2></div><SettingPlay /></section>
-        <section id="SettingMediaServerPlayback" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingMediaServerPlayback.title as Parameters<typeof t>[0]) }}</h2></div><SettingMediaServerPlayback /></section>
-        <section id="SettingDanmaku" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDanmaku.title as Parameters<typeof t>[0]) }}</h2></div><SettingDanmaku /></section>
-        <section id="SettingPan" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingPan.title as Parameters<typeof t>[0]) }}</h2></div><SettingPan /></section>
-        <section id="SettingDown" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDown.title as Parameters<typeof t>[0]) }}</h2></div><SettingDown /></section>
-        <section id="SettingDownloadAdvanced" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDownloadAdvanced.title as Parameters<typeof t>[0]) }}</h2></div><SettingDownloadAdvanced /></section>
-        <section id="SettingUpload" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingUpload.title as Parameters<typeof t>[0]) }}</h2></div><SettingUpload /></section>
-        <section id='SettingWebDav' class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingWebDav.title as Parameters<typeof t>[0]) }}</h2></div><SettingWebDav /></section>
-        <section id="SettingDebug" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDebug.title as Parameters<typeof t>[0]) }}</h2></div><SettingDebug /></section>
-        <section id="SettingProxy" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingProxy.title as Parameters<typeof t>[0]) }}</h2></div><SettingProxy /></section>
-        <section id="SettingAria" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingAria.title as Parameters<typeof t>[0]) }}</h2></div><SettingAria /></section>
-        <section id="SettingLog" class="settings-section">
+        <section v-show="activeSettingsPage === 'SettingUI'" id="SettingUI" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingUI.title as Parameters<typeof t>[0]) }}</h2></div><SettingUI /></section>
+        <section v-show="activeSettingsPage === 'SettingAccount'" id="SettingAccount" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingAccount.title as Parameters<typeof t>[0]) }}</h2></div><SettingAccount /></section>
+        <section v-show="activeSettingsPage === 'SettingAPI'" id="SettingAPI" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingAPI.title as Parameters<typeof t>[0]) }}</h2></div><SettingAPI /></section>
+        <section v-show="activeSettingsPage === 'SettingSecurity'" id="SettingSecurity" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingSecurity.title as Parameters<typeof t>[0]) }}</h2></div><SettingSecurity /></section>
+        <section v-show="activeSettingsPage === 'SettingPlay'" id="SettingPlay" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingPlay.title as Parameters<typeof t>[0]) }}</h2></div><SettingPlay /></section>
+        <section v-show="activeSettingsPage === 'SettingGeneral'" id="SettingGeneral" class="settings-section"><div class="settings-section-header"><h2>{{ t('general.generalTitlePage') }}</h2></div><SettingGeneral /></section>
+        <section v-show="activeSettingsPage === 'SettingSeriesVersions'" id="SettingSeriesVersions" class="settings-section"><div class="settings-section-header"><h2>{{ t('seriesVersions.seriesVersions') }}</h2></div><SettingSeriesVersions /></section>
+        <section v-show="activeSettingsPage === 'SettingMediaServerPlayback'" id="SettingMediaServerPlayback" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingMediaServerPlayback.title as Parameters<typeof t>[0]) }}</h2></div><SettingMediaServerPlayback /></section>
+        <section v-show="activeSettingsPage === 'SettingDanmaku'" id="SettingDanmaku" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDanmaku.title as Parameters<typeof t>[0]) }}</h2></div><SettingDanmaku /></section>
+        <section v-show="activeSettingsPage === 'SettingPan'" id="SettingPan" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingPan.title as Parameters<typeof t>[0]) }}</h2></div><SettingPan /></section>
+        <section v-show="activeSettingsPage === 'SettingDown'" id="SettingDown" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDown.title as Parameters<typeof t>[0]) }}</h2></div><SettingDown /></section>
+        <section v-show="activeSettingsPage === 'SettingDownloadAdvanced'" id="SettingDownloadAdvanced" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDownloadAdvanced.title as Parameters<typeof t>[0]) }}</h2></div><SettingDownloadAdvanced /></section>
+        <section v-show="activeSettingsPage === 'SettingUpload'" id="SettingUpload" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingUpload.title as Parameters<typeof t>[0]) }}</h2></div><SettingUpload /></section>
+        <section v-show="activeSettingsPage === 'SettingDebug'" id="SettingDebug" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingDebug.title as Parameters<typeof t>[0]) }}</h2></div><SettingDebug /></section>
+        <section v-show="activeSettingsPage === 'SettingProxy'" id="SettingProxy" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingProxy.title as Parameters<typeof t>[0]) }}</h2></div><SettingProxy /></section>
+        <section v-show="activeSettingsPage === 'SettingAria'" id="SettingAria" class="settings-section"><div class="settings-section-header"><h2>{{ t(sectionMeta.SettingAria.title as Parameters<typeof t>[0]) }}</h2></div><SettingAria /></section>
+        <section v-show="activeSettingsPage === 'SettingLog'" id="SettingLog" class="settings-section">
           <div class="settings-section-header"><h2>{{ t(sectionMeta.SettingLog.title as Parameters<typeof t>[0]) }}</h2></div>
           <div v-if="hideSetting" style="min-height: 602px"></div>
           <SettingLog v-else />
@@ -1061,4 +1048,54 @@ body[arco-theme='dark'] .settingcard .arco-radio-group-button .arco-radio-checke
     max-width: 100%;
   }
 }
+
+/* Approved settings design: flat rows, green line icons, one content surface. */
+#xbybody .settings-shell { background:var(--color-bg-1); }
+#xbybody .settings-sider { background:var(--color-bg-1) !important;box-shadow:none;backdrop-filter:none;border-right:1px solid #5c876432; }
+#xbybody .settings-side-title {background:none;border:0;box-shadow:none;border-radius:0;padding:12px 8px;min-height:64px;}
+#xbybody .settings-side-title strong {color:var(--color-text-1);font-size:23px;}
+#xbybody .settings-side-kicker {display:none;}
+#xbybody .settings-sider .arco-menu-inner {background:none;}
+#xbybody .settings-sider .arco-menu-item {border-radius:0;background:transparent;border-bottom:1px solid #63866a30;min-height:52px;}
+#xbybody .settings-sider .arco-menu-item .arco-icon, #xbybody .settings-sider .arco-menu-item .iconfont {color:#20c66d;}
+#xbybody .settings-sider .arco-menu-selected {background:#20c66d14;color:var(--color-text-1);}
+#xbybody #SettingObserver {background:var(--color-bg-1);padding:0 24px 24px !important;}
+#xbybody #SettingObserver .settings-section {background:transparent;border:0;border-radius:0;box-shadow:none;margin:0;padding:0;}
+#xbybody #SettingObserver .settings-section-header {padding:20px 22px 10px;border:0;background:none;}
+#xbybody #SettingObserver #SettingUI>.settings-section-header {display:none;}
+#xbybody #SettingObserver .settingcard {border:0;border-radius:0;background:transparent !important;box-shadow:none;padding:0;}
+#xbybody #SettingObserver .settingrow {border:0;border-bottom:1px solid #63866a35;border-radius:0;background:transparent !important;box-shadow:none;min-height:64px;margin:0 22px;padding:16px 0;}
+#xbybody #SettingObserver .settinghead {border-radius:0;background:transparent;box-shadow:none;padding:20px 22px 8px;color:var(--color-text-2);}
+#xbybody #SettingObserver .settingrow>.arco-icon,#xbybody #SettingObserver .settingrow>.iconfont {color:#20c66d;}
+#xbybody #SettingObserver .settings-app-hero {display:none;}
+#xbybody #SettingObserver .settings-app-actions {margin:0 22px;padding:20px 0;border-bottom:1px solid #63866a35;background:none;border-radius:0;box-shadow:none;}
+#xbybody #SettingObserver .setting-account-panel {background:none;border:0;box-shadow:none;padding:0;}
+@media(max-width:760px){#xbybody #SettingObserver{padding:0 0 20px !important;}.bp-settings-header{padding-inline:18px;}}
+
+#xbybody .settings-sider .xbyleftmenu .arco-menu-item:hover,#xbybody .settings-sider .xbyleftmenu .arco-menu-selected {background:#20c66d14 !important;color:var(--color-text-1) !important;box-shadow:none;transform:none;}
+#xbybody .settings-sider .xbyleftmenu .arco-menu-selected::before {background:#20c66d;left:0;top:12px;bottom:12px;width:2px;}
+
+#xbybody #SettingObserver .settings-app-version {font-size:12px;color:var(--color-text-3);margin-right:auto;}
+/* Neutral settings surfaces share the media library orange accent. */
+#xbybody .settings-shell{background:var(--color-bg-2)}
+#xbybody .settings-sider{background:var(--color-bg-2)!important;border-color:var(--color-border-2)}
+#xbybody #SettingObserver{background:var(--color-bg-2)}
+#xbybody .settings-sider .xbyleftmenu .arco-menu-item .arco-icon,#xbybody .settings-sider .xbyleftmenu .arco-menu-item .iconfont{color:#ff8a00}
+#xbybody .settings-sider .xbyleftmenu .arco-menu-item:hover,#xbybody .settings-sider .xbyleftmenu .arco-menu-selected{background:#ff8a0018!important}
+#xbybody .settings-sider .xbyleftmenu .arco-menu-selected::before{background:#ff8a00}
+#xbybody #SettingObserver .settinghead::after{background:linear-gradient(90deg,#ff8a00,#ff8a0030)}
+
+body:not([arco-theme='dark']) #xbybody .settings-shell,body:not([arco-theme='dark']) #xbybody #SettingObserver,body:not([arco-theme='dark']) #xbybody .settings-sider{background:#f3f3f7!important}
+body[arco-theme='dark'] #xbybody .settings-shell,body[arco-theme='dark'] #xbybody #SettingObserver,body[arco-theme='dark'] #xbybody .settings-sider{background:#1c1c1e!important}
 </style>
+
+<style scoped>
+.settings-support-links { margin:16px 10px 24px; padding-top:12px; border-top:1px solid var(--color-border-2) }
+.settings-support-links button { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; padding:12px; border:0; border-radius:7px; background:transparent; color:var(--color-text-2); cursor:pointer; text-align:left; font:inherit }
+.settings-support-links button:hover { background:var(--color-fill-2) }
+.settings-support-links button:focus-visible { outline:2px solid rgb(var(--primary-6)); outline-offset:1px }
+.settings-support-links svg { flex-shrink:0; opacity:.55 }
+
+</style>
+
+<style src="./settings-reference.css"></style>

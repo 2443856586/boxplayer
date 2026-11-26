@@ -7,8 +7,11 @@ declare global {
     require: any
     Electron: any
     openDatabase: any
+    WebStartupLock: (action: 'status' | 'unlock' | 'save' | 'disable', current?: string, next?: string) => Promise<{ ok?: boolean; enabled?: boolean; locked?: boolean }>
     WebIsE2E: boolean
     WebE2EAllowTransfers: boolean
+    WebE2EStartupDiagnostics?: () => Array<{ provider: string; reason: string; httpStatus?: number }>
+    WebE2ESeedCloudAccounts?: (accounts: unknown[], defaultUserId: string) => Promise<void>
     WebRelaunchAria: () => Promise<number>
     platform: string
     WebGetPathForFile: (file: File) => string
@@ -42,6 +45,8 @@ declare global {
     WebPlatformSync: any
     AutoUpdateGetState?: () => Promise<any>
     AutoUpdateCheck?: (force?: boolean) => Promise<any>
+    AutoUpdateDownload?: () => Promise<any>
+    AutoUpdateAcknowledge?: () => Promise<any>
     AutoUpdateInstall?: () => Promise<boolean>
     AutoUpdateOnStateChanged?: (callback: (state: any) => void) => () => void
     UploadPort: any
@@ -56,13 +61,21 @@ declare global {
     IsMainPage: boolean
     WebSetProxy: any
     WebMpvEmbeddedCapability: () => Promise<any>
+    WebMusicAudioCapability: () => Promise<{ available: boolean }>
+    WebMusicAudioLoad: (data: any) => Promise<any>
+    WebMusicAudioControl: (data: any) => Promise<any>
+    WebMusicAudioStatus: () => Promise<any>
     WebMpvEmbeddedLoad: (data: any) => Promise<any>
     WebMpvEmbeddedControl: (data: any) => Promise<any>
     WebMpvEmbeddedStatus: () => Promise<any>
     WebMpvSharedTextureCapability: () => { available: boolean; platform: string; reason?: string }
     WebMpvSharedTexture: {
+    onStatus?: (callback: (status: any) => void) => void
+    removeStatusListener?: () => void
       isAvailable: () => boolean
       onFrame: (callback: (videoFrame: VideoFrame, index: number) => void) => void
+      onSoftwareFrame: (callback: (pixels: Uint8Array, width: number, height: number, index: number, transformed?: boolean) => void) => void
+      removeSoftwareFrameListener: () => void
       removeFrameListener: () => void
       onClear: (callback: () => void) => void
       removeClearListener: () => void

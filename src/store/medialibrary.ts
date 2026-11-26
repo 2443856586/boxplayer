@@ -1,10 +1,13 @@
+import useCategoryPlacement from './categoryPlacement'
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import type { MediaLibraryItem, MediaLibraryFolder, MediaFilter, FavoriteId, PlaylistMap } from '../types/media'
 import { getWebDavConnections } from '../utils/webdavClient'
 import DB from '../utils/db'
-import { preserveManualMediaMetadata } from '../utils/mediaMetadataEditor'
 import { mergeDriveFileSources, reconcileMediaItemSource } from '../utils/mediaSourceMembership'
+import { MediaPersistenceError, mediaPersistenceSnapshot } from '../utils/mediaPersistenceSnapshot'
+import { mergeScrapedMedia, scrapedMediaId } from '../utils/mediaScrapeMerge'
+import { t } from '../i18n'
 
 // 本地存储的键名
 const STORAGE_KEYS = {
@@ -18,6 +21,7 @@ const STORAGE_KEYS = {
 }
 const MEDIA_LIBRARY_DEXIE_MIGRATION_KEY = 'MediaLibrary_DexieMigrated_v1'
 const MEDIA_LIBRARY_CACHE_PAGE_SIZE = 100
+const RECENT_RECOVERY_KEY = 'MediaLibrary_RecentRecovery_v1'
 
 const shouldLoadLegacyMediaLibrary = () => {
   try { return localStorage.getItem(MEDIA_LIBRARY_DEXIE_MIGRATION_KEY) !== '1' } catch { return true }
@@ -111,6 +115,7 @@ export const syncMediaLibraryStoreFromStorage = (store: {
 
 export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
   // 状态 - 从localStorage加载初始数据
+  const catalogRevision = ref(0)
   const mediaItems = ref<MediaLibraryItem[]>(shouldLoadLegacyMediaLibrary() ? loadFromStorage(STORAGE_KEYS.MEDIA_ITEMS, []) : [])
   const folders = ref<MediaLibraryFolder[]>(shouldLoadLegacyMediaLibrary() ? normalizeFolders(loadFromStorage(STORAGE_KEYS.FOLDERS, [])) : [])
   const isScanning = ref(false)
@@ -127,6 +132,7 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
   const mediaChannel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('boxplayer-media-library')
   let mediaSaveTimer: ReturnType<typeof setTimeout> | undefined
   let mediaWriteChain: Promise<void> = Promise.resolve()
+  let mediaWriteError: unknown
   let isHydrating = false
   let persistenceBatchDepth = 0
   const persistenceWatchStops: Array<() => void> = []
@@ -199,9 +205,9 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     if (isHydrating) return
     const folderDeletes = Array.from(deletedFolderIds)
     const deletedFolderSet = new Set(folderDeletes)
-    const itemUpserts = Array.from(dirtyMediaItems.values()).filter(item => !item.folderId || !deletedFolderSet.has(item.folderId))
+    const itemUpserts = mediaPersistenceSnapshot(Array.from(dirtyMediaItems.values()).filter(item => !item.folderId || !deletedFolderSet.has(item.folderId)))
     const itemDeletes = Array.from(deletedMediaItemIds)
-    const folderUpserts = Array.from(dirtyFolders.values())
+    const folderUpserts = mediaPersistenceSnapshot(Array.from(dirtyFolders.values()))
     if (!itemUpserts.length && !itemDeletes.length && !folderUpserts.length && !folderDeletes.length) return
 
     dirtyMediaItems.clear()
@@ -215,17 +221,29 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
         await DB.deleteMediaLibraryItems(itemDeletes)
         await DB.deleteMediaLibraryFolders(folderDeletes)
         await DB.upsertMediaLibraryFolders(folderUpserts)
-        await DB.upsertMediaLibraryItems(itemUpserts)
+        // Store snapshots are complete; replacements must allow edits and removals.
+        await DB.upsertMediaLibraryItems(itemUpserts, false)
+        mediaWriteError = undefined
+        catalogRevision.value++
         void refreshMediaCounts()
         mediaChannel?.postMessage({ type: 'changed' })
       })
       .catch((error) => {
+        mediaWriteError = error
         itemUpserts.forEach(markMediaItemDirty)
         itemDeletes.forEach(markMediaItemDeleted)
         folderUpserts.forEach(markFolderDirty)
         folderDeletes.forEach(markFolderDeleted)
         console.error('Error saving media library to DB:', error)
       })
+  }
+
+  const flushPersistence = async () => {
+    if (mediaSaveTimer) clearTimeout(mediaSaveTimer)
+    await mediaWriteChain
+    persistMediaLibrary()
+    await mediaWriteChain
+    if (mediaWriteError) throw new MediaPersistenceError(mediaWriteError)
   }
 
   const scheduleMediaSave = () => {
@@ -245,9 +263,11 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     mediaTypeCounts.value = { movie, tv, unmatched }
   }
 
-  const hydrate = async () => {
+  const hydrateInternal = async () => {
+    await mediaWriteChain
     if (typeof indexedDB === 'undefined') {
       hydrated.value = true
+      catalogRevision.value++
       return
     }
     try {
@@ -275,6 +295,28 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
         items = Array.from(itemMap.values())
         folderList = Array.from(folderMap.values())
       }
+      if (localStorage.getItem(RECENT_RECOVERY_KEY) !== '1') {
+        const folderIds = new Set(folderList.map(folder => folder.id))
+        const candidates = recentlyAdded.value.filter(item => item.folderId && folderIds.has(item.folderId)
+          && !deletedMediaItemIds.has(item.id)
+          && (item.driveFiles?.some(file => !!file.id) || item.seasons?.some(season => season.episodes?.some(episode => episode.driveFiles?.some(file => !!file.id)))))
+        const existing = await DB.getMediaLibraryItemsByIds(candidates.map(item => item.id))
+        const existingIds = new Set(existing.map(item => item.id))
+        const missing = candidates.filter(item => !existingIds.has(item.id))
+        if (missing.length) {
+          // Preserve the original journal; never overwrite existing DB metadata.
+          if (!localStorage.getItem(`${RECENT_RECOVERY_KEY}_backup`)) saveToStorage(`${RECENT_RECOVERY_KEY}_backup`, recentlyAdded.value)
+          await DB.upsertMediaLibraryItems(mediaPersistenceSnapshot(missing))
+          console.info(`Recovered ${missing.length} media records from the recent journal`)
+        }
+        localStorage.setItem(RECENT_RECOVERY_KEY, '1')
+      }
+      const persistedRecent = await DB.getMediaLibraryItemsByIds(recentlyAdded.value.map(item => item.id))
+      const recentById = new Map(persistedRecent.map(item => [item.id, item]))
+      recentlyAdded.value = recentlyAdded.value.flatMap(item => {
+        const canonical = recentById.get(item.id) || dirtyMediaItems.get(item.id)
+        return canonical ? [canonical] : []
+      })
       mediaItems.value = items.length ? items.slice(0, MEDIA_LIBRARY_CACHE_PAGE_SIZE) : await DB.getMediaLibraryPage({ limit: MEDIA_LIBRARY_CACHE_PAGE_SIZE })
       folders.value = folderList
       updateFilters()
@@ -286,6 +328,12 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
       hydrated.value = true
       if (dirtyMediaItems.size || deletedMediaItemIds.size || dirtyFolders.size || deletedFolderIds.size) scheduleMediaSave()
     }
+  }
+
+  let hydrationPromise: Promise<void> | undefined
+  const hydrate = () => {
+    if (!hydrationPromise) hydrationPromise = hydrateInternal().finally(() => { hydrationPromise = undefined })
+    return hydrationPromise
   }
 
   mediaChannel?.addEventListener('message', (event) => {
@@ -307,17 +355,16 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     mediaItems.value
       .filter(item => item.rating && item.rating > 0)
       .sort((a, b) => (b.rating || 0) - (a.rating || 0))
-      .slice(0, 20)
+      .slice(0, 30)
   )
 
   const ratingCategories = computed(() => {
     const categories = [
-      { range: [1, 5.99], label: '1-5分', items: [] as MediaLibraryItem[] },
-      { range: [6, 6.99], label: '6分', items: [] as MediaLibraryItem[] },
-      { range: [7, 7.99], label: '7分', items: [] as MediaLibraryItem[] },
-      { range: [8, 8.99], label: '8分', items: [] as MediaLibraryItem[] },
-      { range: [9, 9.99], label: '9分', items: [] as MediaLibraryItem[] },
-      { range: [10, 10], label: '10分', items: [] as MediaLibraryItem[] }
+      { range: [8, 10], label: t('aggregation.rating8To10'), items: [] as MediaLibraryItem[] },
+      { range: [7, 7.99], label: t('home.ratingStars', { count: 7 }), items: [] as MediaLibraryItem[] },
+      { range: [6, 6.99], label: t('home.ratingStars', { count: 6 }), items: [] as MediaLibraryItem[] },
+      { range: [5, 5.99], label: t('home.ratingStars', { count: 5 }), items: [] as MediaLibraryItem[] },
+      { range: [1, 4.99], label: t('aggregation.rating1To4'), items: [] as MediaLibraryItem[] }
     ]
 
     mediaItems.value.forEach(item => {
@@ -340,7 +387,10 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
       }
     })
 
-    return categories
+    return [{
+      name: t('aggregation.top30'), count: topRated.value.length, type: 'rating' as const,
+      range: [1, 10], items: topRated.value
+    }, ...categories
       .filter(c => c.items.length > 0)
       .map(c => ({
         name: c.label,
@@ -348,29 +398,32 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
         type: 'rating' as const,
         range: c.range,
         items: c.items
-      }))
+      }))].filter(c => c.items.length > 0)
   })
 
   const yearGroups = computed(() => {
     const groups: { [key: string]: MediaLibraryItem[] } = {}
+    const dated = mediaItems.value.filter(item => item.year && Number.isFinite(parseInt(item.year)))
 
     mediaItems.value.forEach(item => {
       if (item.year) {
         const year = parseInt(item.year)
-        const decade = Math.floor(year / 10) * 10
-        const key = `${decade}s`
+        if (!Number.isFinite(year) || year <= 0) return
+        const key = year >= 2020 ? '2020+' : year < 1940 ? t('aggregation.earlier') : `${Math.floor(year / 10) * 10}s`
         if (!groups[key]) groups[key] = []
         groups[key].push(item)
       }
     })
 
-    return Object.entries(groups)
-      .sort(([a], [b]) => parseInt(b) - parseInt(a))
-      .map(([year, items]) => ({
-        name: year,
-        count: items.length,
+    const newest = [...dated].sort((a, b) => String(b.releaseDate || b.year || '').localeCompare(String(a.releaseDate || a.year || ''))).slice(0, 30)
+    const order = ['2020+', '2010s', '2000s', '1990s', '1980s', '1970s', '1960s', '1950s', '1940s', t('aggregation.earlier')]
+    return [{ name: t('aggregation.newest'), items: newest }, ...order.filter(key => groups[key]?.length).map(key => ({ name: key, items: groups[key] }))]
+      .filter(group => group.items.length > 0)
+      .map(group => ({
+        name: group.name,
+        count: group.items.length,
         type: 'year' as const,
-        items
+        items: group.items
       }))
   })
 
@@ -398,15 +451,15 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
 
   // 方法
   const addMediaItem = (item: MediaLibraryItem) => {
+    const sameIdentity = item.tmdbId && item.type !== 'unmatched' && !item.collectionId
+      ? mediaItems.value.find(existing => existing.type === item.type && existing.tmdbId === item.tmdbId && !existing.collectionId)
+      : undefined
+    if (sameIdentity) item.id = sameIdentity.id
+    else if (item.tmdbId && item.type !== 'unmatched' && !item.collectionId && mediaItems.value.some(existing => existing.id === item.id && existing.type !== item.type)) item.id = scrapedMediaId(item.type, item.tmdbId)
     const existingIndex = mediaItems.value.findIndex(i => i.id === item.id)
     if (existingIndex >= 0) {
       const existing = mediaItems.value[existingIndex]
-      item = preserveManualMediaMetadata(existing, {
-        ...existing,
-        ...item,
-        folderId: existing.folderId || item.folderId,
-        driveFiles: uniqueDriveFiles([...(existing.driveFiles || []), ...(item.driveFiles || [])])
-      })
+      item = mergeScrapedMedia(existing, item)
       mediaItems.value[existingIndex] = item
     } else {
       mediaItems.value.push(item)
@@ -450,145 +503,16 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     return persistedItem
   }
 
-  // 添加电视剧合并方法
-  const addOrMergeTvSeries = (newTvItem: MediaLibraryItem): boolean => {
-    if (newTvItem.type !== 'tv') {
-      if (newTvItem.collectionId) {
-        const index = mediaItems.value.findIndex(item => item.collectionId === newTvItem.collectionId)
-        if (index >= 0) {
-          const existing = mediaItems.value[index]
-          const movies = new Map((existing.collectionMovies || []).map(movie => [movie.tmdbId, movie]))
-          for (const movie of newTvItem.collectionMovies || []) {
-            const previous = movies.get(movie.tmdbId)
-            movies.set(movie.tmdbId, previous ? { ...previous, ...movie, driveFiles: uniqueDriveFiles([...previous.driveFiles, ...movie.driveFiles]) } : movie)
-          }
-          const updated = { ...existing, driveFiles: uniqueDriveFiles([...existing.driveFiles, ...newTvItem.driveFiles]), collectionMovies: Array.from(movies.values()).sort((a, b) => Number(a.year || 0) - Number(b.year || 0)), addedAt: new Date() }
-          mediaItems.value[index] = updated
-          markMediaItemDirty(updated)
-          return true
-        }
-      }
-      addMediaItem(newTvItem)
-      return true
-    }
-
-    // 查找是否已存在同名的电视剧
-    const existingTvIndex = mediaItems.value.findIndex(item =>
-      item.type === 'tv' &&
-      (item.id === newTvItem.id || (item.tmdbId === newTvItem.tmdbId && item.name === newTvItem.name))
-    )
-
-    if (existingTvIndex >= 0) {
-      // 找到现有的电视剧，合并季集信息
-      console.log(`🔄 合并电视剧: ${newTvItem.name}`)
-      const existingTv = mediaItems.value[existingTvIndex]
-
-      const expectedSeasonMap = new Map((existingTv.expectedSeasons || []).map(season => [season.seasonNumber, season]))
-      for (const season of newTvItem.expectedSeasons || []) {
-        const existing = expectedSeasonMap.get(season.seasonNumber)
-        expectedSeasonMap.set(season.seasonNumber, {
-          ...existing,
-          ...season,
-          episodes: season.episodes?.length ? season.episodes : existing?.episodes
-        })
-      }
-
-      // 合并seasons
-      const mergedSeasons = [...(existingTv.seasons || [])]
-      if (newTvItem.seasons && newTvItem.seasons.length > 0) {
-        const newSeason = newTvItem.seasons[0]
-        const existingSeasonIndex = mergedSeasons.findIndex(s => s.seasonNumber === newSeason.seasonNumber)
-
-        if (existingSeasonIndex >= 0) {
-          // 季已存在，更新episode count
-          mergedSeasons[existingSeasonIndex] = {
-            ...mergedSeasons[existingSeasonIndex],
-            episodeCount: Math.max(
-              mergedSeasons[existingSeasonIndex].episodeCount || 0,
-              newSeason.episodeCount || 0
-            )
-          }
-        } else {
-          // 新季，直接添加
-          console.log(`  📺 添加新季: 第${newSeason.seasonNumber}季`)
-          mergedSeasons.push(newSeason)
-        }
-      }
-
-      // 合并集数信息（从seasons中的episodes处理）
-      const mergedSeasonsCopy = [...mergedSeasons]
-
-      // 处理新项目中的集数信息
-      if (newTvItem.seasons && newTvItem.seasons.length > 0) {
-        newTvItem.seasons.forEach(newSeason => {
-          const existingSeasonIndex = mergedSeasonsCopy.findIndex(s => s.seasonNumber === newSeason.seasonNumber)
-
-          if (existingSeasonIndex >= 0 && newSeason.episodes && newSeason.episodes.length > 0) {
-            // 季已存在，合并episodes
-            const existingSeason = mergedSeasonsCopy[existingSeasonIndex]
-            const mergedEpisodes = [...(existingSeason.episodes || [])]
-
-            newSeason.episodes.forEach(newEpisode => {
-              const existingEpisodeIndex = mergedEpisodes.findIndex(e =>
-                e.seasonNumber === newEpisode.seasonNumber &&
-                e.episodeNumber === newEpisode.episodeNumber
-              )
-
-              if (existingEpisodeIndex >= 0) {
-                // 集已存在，合并driveFiles
-                console.log(`  📹 合并集数: S${newEpisode.seasonNumber}E${newEpisode.episodeNumber}`)
-                const existingEpisode = mergedEpisodes[existingEpisodeIndex]
-                mergedEpisodes[existingEpisodeIndex] = {
-                  ...existingEpisode,
-                  driveFiles: uniqueDriveFiles([...existingEpisode.driveFiles, ...newEpisode.driveFiles])
-                }
-              } else {
-                // 新集，直接添加
-                console.log(`  ➕ 添加新集: S${newEpisode.seasonNumber}E${newEpisode.episodeNumber}`)
-                mergedEpisodes.push(newEpisode)
-              }
-            })
-
-            // 更新季的episodes
-            mergedSeasonsCopy[existingSeasonIndex] = {
-              ...existingSeason,
-              episodes: mergedEpisodes.sort((a, b) => a.episodeNumber - b.episodeNumber)
-            }
-          }
-        })
-      }
-
-      // 合并driveFiles到主条目
-      const mergedDriveFiles = uniqueDriveFiles([
-        ...(existingTv.driveFiles || []),
-        ...newTvItem.driveFiles
-      ])
-
-      // 更新现有条目
-      const updatedTv: MediaLibraryItem = {
-        ...existingTv,
-        seasons: mergedSeasonsCopy.sort((a, b) => a.seasonNumber - b.seasonNumber),
-        expectedSeasons: [...expectedSeasonMap.values()].sort((a, b) => a.seasonNumber - b.seasonNumber),
-        driveFiles: mergedDriveFiles,
-        credits: existingTv.credits || newTvItem.credits,
-        addedAt: new Date() // 更新添加时间
-      }
-
-      mediaItems.value[existingTvIndex] = updatedTv
-      markMediaItemDirty(updatedTv)
-      updateFilters()
-      return true
-    } else {
-      // 新电视剧，直接添加
-      console.log(`🆕 新增电视剧: ${newTvItem.name}`)
-      addMediaItem(newTvItem)
-      return true
-    }
+  // All scrape paths share the same identity and season/file merge rules.
+  const addOrMergeTvSeries = (item: MediaLibraryItem): boolean => {
+    addMediaItem(item)
+    return true
   }
 
   const removeMediaItem = (id: string) => {
     markMediaItemDeleted(id)
     mediaItems.value = mediaItems.value.filter(item => item.id !== id)
+    recentlyAdded.value = recentlyAdded.value.filter(item => item.id !== id)
     updateFilters()
   }
 
@@ -636,6 +560,8 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     const removedItems = mediaItems.value.filter(item => item.folderId === folderId)
     mediaItems.value = mediaItems.value.filter(item => item.folderId !== folderId)
     removedItems.forEach(item => markMediaItemDeleted(item.id))
+    const removedIds = new Set(removedItems.map(item => item.id))
+    recentlyAdded.value = recentlyAdded.value.filter(item => !removedIds.has(item.id))
     const removedCount = removedItems.length
     console.log(`移除了文件夹 ${folderId} 下的 ${removedCount} 个媒体项目`)
     updateFilters()
@@ -679,6 +605,13 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     const targetSourceKey = sourceKey(target)
     const removedFolders = folders.value.filter(folder => folder.id === id || sourceKey(folder) === targetSourceKey)
     const removedFolderIds = new Set(removedFolders.map(folder => folder.id))
+    if (target.isDriveRootFavorite) {
+      // Removing a root clears its media, not separately saved child favorites.
+      for (const folder of folders.value) {
+        if (folder.userId === target.userId && folder.driveId === target.driveId
+            && folder.driveServerId === target.driveServerId) reconcileFolderSource(folder.id, [])
+      }
+    }
     reconcileFolderSource(id, [])
     const originalItems = mediaItems.value
     // 删除文件夹
@@ -900,7 +833,7 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
   const isWatchedById = (id: string) => watchedItems.value.includes(id)
 
   const removeWatchedByPrefix = (prefix: string) => {
-    watchedItems.value = watchedItems.value.filter(item => !String(item).startsWith(prefix))
+    watchedItems.value = watchedItems.value.filter(item => item !== prefix && !String(item).startsWith(prefix + '_'))
   }
 
   const removeFromContinueWatching = (id: string) => {
@@ -936,6 +869,7 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     const items = playlists.value[oldName]
     const { [oldName]: _removed, ...rest } = playlists.value
     playlists.value = { ...rest, [trimmed]: items }
+    useCategoryPlacement().renameRoute('playlist/' + encodeURIComponent(oldName), 'playlist/' + encodeURIComponent(trimmed))
   }
 
   const isInPlaylist = (name: string, itemId: string) => {
@@ -992,6 +926,7 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
   return {
     // 状态
     mediaItems,
+    catalogRevision,
     folders,
     hydrated,
     mediaItemCount,
@@ -1052,6 +987,7 @@ export const useMediaLibraryStore = defineStore('mediaLibrary', () => {
     updateFilters,
     beginPersistenceBatch,
     checkpointPersistenceBatch,
+    flushPersistence,
     hydrate,
     endPersistenceBatch,
     clearAllData

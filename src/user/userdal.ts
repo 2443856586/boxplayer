@@ -23,7 +23,7 @@ import { createRemoteDriveAccount } from '../utils/remoteDriveAccount'
 import { supportsAliyunAutoSign } from './autoSignPolicy'
 import { getStoredTokenProvider } from '../utils/driveProvider'
 import { captureProviderLogin } from '../analytics/posthog'
-import { withStartupTimeout } from '../utils/startupTask'
+import { recoverLateStartupTask, withStartupTimeout } from '../utils/startupTask'
 import { loadInitialProviderRoot, selectInitialAliyunRoot, shouldRetryInitialRootLoad } from './startupProviderRootLoad'
 
 export const UserTokenMap = new Map<string, ITokenInfo>()
@@ -31,6 +31,7 @@ export const UserTokenMap = new Map<string, ITokenInfo>()
 const getTokenRefreshState = (token: ITokenInfo) => [token.access_token, token.refresh_token, token.expires_in, token.expire_time, token.token_type, token.default_drive_id].join('\u0000')
 
 export default class UserDAL {
+  private static loginRevision = 0
   private static cliSyncTimer: ReturnType<typeof setTimeout> | undefined
 
   private static toCliProvider(token: ITokenInfo): string {
@@ -120,12 +121,13 @@ export default class UserDAL {
       const ok = !!(token.user_id && (await AliUser.ApiTokenRefreshAccount(token, false)))
       return ok ? token : null
     } catch (err: any) {
-      DebugLog.mSaveDanger('ensureTokenReady', err)
+      DebugLog.mSaveDanger('ensureTokenReady ' + getStoredTokenProvider(token), err)
       return null
     }
   }
 
   static async aLoadFromDB() {
+    const loginRevision = ++this.loginRevision
     const tokenList = await DB.getUserAll()
     for (const connection of getWebDavConnections()) {
       const token = createRemoteDriveAccount(connection).token
@@ -163,8 +165,9 @@ export default class UserDAL {
     for (let index = 0; index < orderedTokens.length; index++) {
       const token = orderedTokens[index]
       // 还未选出可登录账号：依次尝试。任意一步失败都 fallback 到下一个
+      const initialization = this.ensureTokenReady(token)
       try {
-        const prepared = await withStartupTimeout(this.ensureTokenReady(token), `账号 ${token?.user_id || ''} 初始化`)
+        const prepared = await withStartupTimeout(initialization, `账号 ${token?.user_id || ''} 初始化`)
         if (!prepared?.user_id) continue
         await this.UserLogin(prepared)
         hasLogin = true
@@ -173,6 +176,20 @@ export default class UserDAL {
         break
       } catch (err: any) {
         DebugLog.mSaveDanger('aLoadFromDB userLogin ' + (token?.user_id || ''), err)
+        // The timeout bounds startup, but does not cancel the provider's HTTP
+        // refresh. Accept a late success only while nobody has signed in.
+        void recoverLateStartupTask(initialization,
+          prepared => Boolean(prepared?.user_id) && loginRevision === this.loginRevision && !hasLogin && !useUserStore().userLogined,
+          async prepared => {
+            hasLogin = true
+            try {
+              await this.UserLogin(prepared!)
+              useUserStore().userShowLogin = false
+            } catch (error) {
+              hasLogin = useUserStore().userLogined
+              throw error
+            }
+          }, error => DebugLog.mSaveDanger('aLoadFromDB late initialization', error))
         // 失败的账号 token 已在 UserTokenMap 中（顶部统一塞过），
         // UserInfo.vue 仍可列出并支持手动切换
       }
@@ -360,7 +377,9 @@ export default class UserDAL {
   }
 
 
-  static async UserLogin(token: ITokenInfo, isInteractive: boolean = false) {
+  static async UserLogin(token: ITokenInfo, isInteractive: boolean = false, sourceName?: string) {
+    const keepFileSourcesPage = useUserStore().loginFromFileSources
+    ++this.loginRevision
     const loadingKey = 'userlogin_' + Date.now().toString()
     message.loading('加载用户信息中...', 0, loadingKey)
     const initialUserId = token.user_id
@@ -403,6 +422,7 @@ export default class UserDAL {
     } else if (token.user_id) {
       useUserStore().userLogin(token.user_id)
     }
+    if (sourceName?.trim()) token.source_name = sourceName.trim()
     UserDAL.SaveUserToken(token)
     window.WebUserToken({
       user_id: token.user_id,
@@ -419,13 +439,13 @@ export default class UserDAL {
     if (isInteractive && token.tokenfrom !== 'unknown') captureProviderLogin(token.tokenfrom)
     // 刷新所有状态
     PanDAL.aReLoadQuickFile(token.user_id)
-    useAppStore().resetTab(useSettingStore().uiDefaultTab || 'pan')
+    if (!keepFileSourcesPage) useAppStore().resetTab(useSettingStore().uiDefaultTab || 'pan')
     useMyShareStore().$reset()
     useMyFollowingStore().$reset()
     useOtherFollowingStore().$reset()
     useFootStore().mSaveUserInfo(token)
     message.success('加载用户成功!', 2, loadingKey)
-    if (isInteractive && token.user_id) {
+    if (isInteractive && token.user_id && !keepFileSourcesPage) {
       const label = token.nick_name || token.user_name || token.user_id
       promptAutoScanForUser(token.user_id, label).catch(() => { /* ignore */ })
     }
@@ -441,7 +461,7 @@ export default class UserDAL {
       }
     }
     if (isCloud123User(token)) {
-      await loadSingleRootDrive(() => PanDAL.aReLoadCloudDrive(token))
+      await loadSingleRootDrive(() => PanDAL.aReLoadCloudDrive(token), 'cloud123')
       return
     }
     if (isBaiduUser(token)) {
@@ -504,6 +524,7 @@ export default class UserDAL {
   }
 
   static async UserLogOff(user_id: string): Promise<boolean> {
+    ++this.loginRevision
     await DB.deleteUser(user_id)
     UserTokenMap.delete(user_id)
 
@@ -532,13 +553,27 @@ export default class UserDAL {
 
 
   static async UserChange(user_id: string): Promise<boolean> {
-    const token = await this.EnsureUserTokenReady(user_id)
-    if (!token) {
-      message.warning('该账号需要重新登陆[' + (UserTokenMap.get(user_id)?.name || user_id) + ']')
+    const accountName = UserTokenMap.get(user_id)?.name || user_id
+    let token: ITokenInfo | null = null
+    try {
+      token = await withStartupTimeout(this.EnsureUserTokenReady(user_id), `切换账号 ${accountName}`, 20_000)
+    } catch (error: any) {
+      DebugLog.mSaveWarning('UserChange ' + user_id, error?.message || error)
+      message.error('切换账号超时，请检查网络连接或代理设置后重试')
       return false
     }
-    await this.UserLogin(token).catch()
-    return true
+    if (!token) {
+      message.warning('该账号验证失败，请检查网络或重新登录[' + accountName + ']')
+      return false
+    }
+    try {
+      await this.UserLogin(token)
+      return true
+    } catch (error: any) {
+      DebugLog.mSaveWarning('UserChange login ' + user_id, error?.message || error)
+      message.error('切换账号失败，请稍后重试[' + accountName + ']')
+      return false
+    }
   }
 
 

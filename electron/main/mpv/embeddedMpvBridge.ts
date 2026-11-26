@@ -4,10 +4,12 @@ import { EmbeddedMpvTextureBridge } from './embeddedMpvTextureBridge'
 import type { EmbeddedMpvStatus, EmbeddedMpvSubtitleStyle, EmbeddedMpvTrackStatus } from './embeddedMpvNativeAddon'
 
 export interface EmbeddedMpvLoadRequest {
+  sessionId?: string
   url?: string
   headers?: Record<string, string>
   title?: string
   startPosition?: number
+  audioOnly?: boolean
 }
 
 export interface EmbeddedMpvLoadResult {
@@ -19,6 +21,7 @@ export interface EmbeddedMpvLoadResult {
 export type EmbeddedMpvControlAction = 'play' | 'pause' | 'stop' | 'seek' | 'setVolume' | 'setSpeed' | 'setAudioTrack' | 'setSubtitleTrack' | 'setSubtitleStyle' | 'setVideoProperty' | 'addAudio' | 'addSubtitle'
 
 export interface EmbeddedMpvControlRequest {
+  sessionId?: string
   action?: EmbeddedMpvControlAction
   value?: number
   url?: string
@@ -29,10 +32,12 @@ export interface EmbeddedMpvControlRequest {
 }
 
 export interface EmbeddedMpvControlResult {
+  sessionId?: string
   ok: boolean
   capability: EmbeddedMpvCapability
   status?: EmbeddedMpvStatus
   trackStatus?: EmbeddedMpvTrackStatus
+  presentedFrames?: number
   error?: string
   warning?: string
 }
@@ -42,6 +47,8 @@ export interface EmbeddedMpvBridge {
   load(request: EmbeddedMpvLoadRequest, sender?: WebContents): Promise<EmbeddedMpvLoadResult>
   control(request: EmbeddedMpvControlRequest): Promise<EmbeddedMpvControlResult>
   getStatus(): Promise<EmbeddedMpvControlResult>
+  acknowledgeSoftwareFrame?(sender: WebContents, ack?: { sessionId?: string; index?: number }): void
+  destroy?(): void
 }
 
 export class DisabledEmbeddedMpvBridge implements EmbeddedMpvBridge {
@@ -81,8 +88,16 @@ export class DisabledEmbeddedMpvBridge implements EmbeddedMpvBridge {
 export class RoutedEmbeddedMpvBridge implements EmbeddedMpvBridge {
   private readonly textureBridge = new EmbeddedMpvTextureBridge()
 
+  destroy(): void {
+    this.textureBridge.destroy()
+  }
+
   getCapability(): EmbeddedMpvCapability {
     return this.textureBridge.getCapability()
+  }
+
+  acknowledgeSoftwareFrame(sender: WebContents, ack?: { sessionId?: string; index?: number }): void {
+    this.textureBridge.acknowledgeSoftwareFrame(sender, ack)
   }
 
   async load(request: EmbeddedMpvLoadRequest, sender?: WebContents): Promise<EmbeddedMpvLoadResult> {

@@ -8,11 +8,13 @@ import os from 'os'
 import { ShowError } from './dialog'
 import { getAsarPath, getStaticPath, getUserDataPath } from '../utils/mainfile'
 import { registerMediaImageCacheIpc } from '../mediaImageCache'
+import { registerTraktIpc } from '../trakt'
 import { createHash } from 'crypto'
 import { getMotrixApplicationRpcPort } from '../aria/runtime'
 import { request as httpsRequest } from 'https'
 import { requestPanHub, requestPanHubStream } from './panHubRequest'
 import { embeddedMpvBridge } from '../mpv/embeddedMpvBridge'
+import { registerMusicAudioIpc } from '../mpv/musicAudioBridge'
 import {
   getBookMeta,
   isBookIndexed,
@@ -34,21 +36,19 @@ import {
   wipeAllData,
   destroyDb
 } from '../reedy/ReedyService'
-import { addMediaAcquisitionCandidate, addMediaAcquisitionEvent, beginMediaAcquisitionCandidateVerification, beginMediaAcquisitionOrganizing, beginMediaAcquisitionSearch, cancelMediaAcquisitionRun, claimRunnableMediaAcquisitionRun, clearCompletedMediaAcquisitionRuns, clearMediaAcquisitionNotifications, completeMediaAcquisitionCandidate, completeMediaAcquisitionRun, continueMediaAcquisitionAfterPartial, createMediaAcquisitionRun, createMediaAcquisitionTracking, endMediaAcquisitionTracking, failMediaAcquisitionCandidate, failMediaAcquisitionRun, finishMediaAcquisitionSearchWithoutCandidates, forceCancelMediaAcquisitionRun, getMediaAcquisitionAgentSandbox, getMediaAcquisitionAgentSession, getMediaAcquisitionCandidateBaseline, getMediaAcquisitionTarget, listMediaAcquisitionNotifications, listMediaAcquisitionRuns, listMediaAcquisitionStates, listMediaAcquisitionTracking, listRunnableMediaAcquisitionRuns, markMediaAcquisitionCandidateTransferring, markMediaAcquisitionNoCoverage, markMediaAcquisitionNotificationsRead, partialMediaAcquisitionCandidate, recordMediaAcquisitionCandidateBaseline, recordMediaAcquisitionExternalTask, recordMediaAcquisitionTransferIntent, releaseMediaAcquisitionRunClaim, renewMediaAcquisitionRunClaim, retryMediaAcquisitionCandidate, retryMediaAcquisitionSearch, saveMediaAcquisitionAgentSandbox, saveMediaAcquisitionAgentSession, selectMediaAcquisitionCandidate, updateMediaAcquisitionExternalTaskProgress, upsertMediaAcquisitionTracking } from '../mediaAcquisition/MediaAcquisitionService'
-import { getMediaAcquisitionProviderTransferStatus, submitMediaAcquisitionExternalUrl, submitMediaAcquisitionProviderShareImport, submitMediaAcquisitionProviderTransfer } from '../mediaAcquisition/MediaProviderAdapter'
-import type { CreateMediaAcquisitionCandidateInput, CreateMediaAcquisitionRunInput, CreateMediaAcquisitionTrackingInput, MediaAcquisitionEvent, MediaAcquisitionFileSnapshot, MediaAcquisitionPhase } from '@shared/types/mediaAcquisition'
-import { getAssrtSubtitleFiles, searchAssrtSubtitles } from '../mediaAcquisition/assrt'
 import { addWorkspaceEvidence, addWorkspaceEvent, approveWorkspacePlan, archiveWorkspaceTask, cancelWorkspaceTask, completeWorkspaceTask, createWorkspaceTask, getWorkspaceTask, getWorkspaceTaskV1Audit, listWorkspaceTasks, rejectWorkspacePlan, restoreWorkspaceTask, resumeWorkspaceTask, saveWorkspacePlan, updateWorkspacePlanSelection } from '../workspaceAgent/WorkspaceAgentService'
+import { registerMediaryIpc } from '../mediary/ipc'
 import type { CreateWorkspacePlanInput, CreateWorkspaceTaskInput, UpdateWorkspacePlanSelectionInput, WorkspaceExecutionEvent } from '@shared/types/workspaceAgent'
 import { agentV1Status, getAgentWorkflow } from '../agent/AgentControlService'
 import { beginAiSearchV1Audit, collectAiSearchStorageStats, confirmAiSearchV1Write, finishAiSearchV1Audit, recordAiSearchV1Evidence, type BeginAiSearchV1AuditInput, type RecordAiSearchV1EvidenceInput } from '../aiSearch/AiSearchV1Bridge'
-import { beginMediaAcquisitionV1Transfer, completeMediaAcquisitionV1Transfer, type MediaAcquisitionTransferTicket } from '../mediaAcquisition/MediaAcquisitionV1Bridge'
 import { beginDocumentV1Audit, finishDocumentV1Audit, recordDocumentV1Citation, type DocumentAgentV1Source } from '../documentInsight/DocumentAgentV1Bridge'
 import { runBundledCloudDriveCli } from '../agent/CloudDriveCliGateway'
 import { completeDocumentReadingUnit, createDocumentReadingJob, failDocumentReadingUnit, getDocumentReadingJob, listDocumentReadingJobs, setDocumentReadingJobStatus } from '../documentInsight/DocumentReadingService'
 import type { CreateDocumentReadingJobInput, DocumentReadingJobStatus } from '@shared/types/documentReading'
 import { downloadAndExtractPdf } from '../documentInsight/PdfExtractionService'
 import { sendPdfProgress } from '../documentInsight/pdfProgress'
+import { buildQuarkCookieHeader, mergeQuarkCookieHeaders, mergeQuarkAccountCookies } from '@shared/quarkCookies'
+import { resolveCloudDriveCliConfigDir } from './cliConfigPath'
 
 let psbId: any
 const panHubStreamControllers = new Map<string, AbortController>()
@@ -56,19 +56,9 @@ const panHubStreamControllers = new Map<string, AbortController>()
 const QUARK_DOWNLOAD_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.56 Chrome/100.0.4896.160 Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch'
 
-const mergeQuarkCookie = (preferredCookie: string, supplementalCookie = '') => {
-  if (!preferredCookie) return supplementalCookie
-  const preferredKeys = new Set(preferredCookie.split(';').map((item) => item.trim().split('=')[0].toLowerCase()).filter(Boolean))
-  const supplemental = supplementalCookie.split(';').map((item) => item.trim()).filter((item) => item && !preferredKeys.has(item.split('=')[0].toLowerCase()))
-  return [preferredCookie, ...supplemental].filter(Boolean).join('; ')
-}
-
-const getQuarkSessionCookieHeader = async () => {
-  const cookies = await session.defaultSession.cookies.get({})
-  return cookies
-    .filter((cookie) => /(^|\.)quark\.cn$/i.test(String(cookie.domain || '').replace(/^\./, '')) && cookie.name && cookie.value)
-    .map((cookie) => `${cookie.name}=${cookie.value}`)
-    .join('; ')
+const getQuarkSessionCookieHeader = async (targetUrl: string) => {
+  const cookies = await session.defaultSession.cookies.get({ url: targetUrl })
+  return buildQuarkCookieHeader(cookies, targetUrl)
 }
 
 function shellQuote(value: string): string {
@@ -235,6 +225,7 @@ export default class ipcEvent {
       })
     }
     registerMediaImageCacheIpc()
+    registerTraktIpc()
     this.handleReedy()
     this.handleMediaAcquisition()
     this.handleDocumentReading()
@@ -242,62 +233,15 @@ export default class ipcEvent {
 
   private static handleMpvEmbedded() {
     ipcMain.handle('MpvEmbedded:getCapability', async () => embeddedMpvBridge.getCapability())
+    registerMusicAudioIpc()
     ipcMain.handle('MpvEmbedded:load', async (event, data) => embeddedMpvBridge.load(data || {}, event.sender))
     ipcMain.handle('MpvEmbedded:control', async (_event, data) => embeddedMpvBridge.control(data || {}))
     ipcMain.handle('MpvEmbedded:getStatus', async () => embeddedMpvBridge.getStatus())
+    ipcMain.on('MpvEmbedded:softwareFrameConsumed', (event, ack) => embeddedMpvBridge.acknowledgeSoftwareFrame?.(event.sender, ack))
   }
 
   private static handleMediaAcquisition() {
-    ipcMain.handle('mediaAcquisition:create', (_event, input: CreateMediaAcquisitionRunInput) => createMediaAcquisitionRun(input))
-    ipcMain.handle('mediaAcquisition:list', (_event, limit?: number) => listMediaAcquisitionRuns(limit))
-    ipcMain.handle('mediaAcquisition:listStates', () => listMediaAcquisitionStates())
-    ipcMain.handle('mediaAcquisition:listRunnable', (_event, limit?: number) => listRunnableMediaAcquisitionRuns(limit))
-    ipcMain.handle('mediaAcquisition:claimRunnable', (_event, workerId: string, runId?: string) => claimRunnableMediaAcquisitionRun(workerId, runId))
-    ipcMain.handle('mediaAcquisition:releaseClaim', (_event, runId: string, workerId: string) => releaseMediaAcquisitionRunClaim(runId, workerId))
-    ipcMain.handle('mediaAcquisition:renewClaim', (_event, runId: string, workerId: string) => renewMediaAcquisitionRunClaim(runId, workerId))
-    ipcMain.handle('mediaAcquisition:listTracking', (_event, limit?: number) => listMediaAcquisitionTracking(limit))
-    ipcMain.handle('mediaAcquisition:createTracking', (_event, input: CreateMediaAcquisitionTrackingInput) => createMediaAcquisitionTracking(input))
-    ipcMain.handle('mediaAcquisition:getTarget', (_event, targetId: string) => getMediaAcquisitionTarget(targetId))
-    ipcMain.handle('mediaAcquisition:endTracking', (_event, trackingId: string) => endMediaAcquisitionTracking(trackingId))
-    ipcMain.handle('mediaAcquisition:upsertTracking', (_event, data: { targetId: string; seasonNumber: number; totalEpisodes: number; latestAiredEpisode: number; obtainedEpisodeNumbers: number[]; missingEpisodes: number[]; status: 'tracking' | 'complete' | 'ended'; nextCheckAt?: number }) => upsertMediaAcquisitionTracking(data.targetId, data.seasonNumber, data.totalEpisodes, data.latestAiredEpisode, data.obtainedEpisodeNumbers, data.missingEpisodes, data.status, data.nextCheckAt))
-    ipcMain.handle('mediaAcquisition:listNotifications', (_event, limit?: number) => listMediaAcquisitionNotifications(limit))
-    ipcMain.handle('mediaAcquisition:markNotificationsRead', (_event, ids?: string[]) => markMediaAcquisitionNotificationsRead(ids))
-    ipcMain.handle('mediaAcquisition:clearNotifications', () => clearMediaAcquisitionNotifications())
-    ipcMain.handle('mediaAcquisition:clearCompletedRuns', () => clearCompletedMediaAcquisitionRuns())
-    ipcMain.handle('mediaAcquisition:getAgentSession', (_event, runId: string) => getMediaAcquisitionAgentSession(runId))
-    ipcMain.handle('mediaAcquisition:saveAgentSession', (_event, runId: string, messages: unknown[]) => saveMediaAcquisitionAgentSession(runId, messages))
-    ipcMain.handle('mediaAcquisition:getAgentSandbox', (_event, runId: string) => getMediaAcquisitionAgentSandbox(runId))
-    ipcMain.handle('mediaAcquisition:saveAgentSandbox', (_event, runId: string, state: Record<string, unknown>) => saveMediaAcquisitionAgentSandbox(runId, state))
-    ipcMain.handle('mediaAcquisition:cancel', (_event, runId: string) => cancelMediaAcquisitionRun(runId))
-    ipcMain.handle('mediaAcquisition:forceCancel', (_event, runId: string) => forceCancelMediaAcquisitionRun(runId))
-    ipcMain.handle('mediaAcquisition:beginSearch', (_event, runId: string) => beginMediaAcquisitionSearch(runId))
-    ipcMain.handle('mediaAcquisition:finishSearchWithoutCandidates', (_event, runId: string) => finishMediaAcquisitionSearchWithoutCandidates(runId))
-    ipcMain.handle('mediaAcquisition:retrySearch', (_event, runId: string, message: string, delayMs: number, maxRetries?: number) => retryMediaAcquisitionSearch(runId, message, delayMs, maxRetries))
-    ipcMain.handle('mediaAcquisition:addCandidate', (_event, runId: string, input: CreateMediaAcquisitionCandidateInput) => addMediaAcquisitionCandidate(runId, input))
-    ipcMain.handle('mediaAcquisition:submitProviderTransfer', (_event, data: { runId: string; candidateId: string; parentId: string; ticket?: MediaAcquisitionTransferTicket | null }) => submitMediaAcquisitionProviderTransfer(data.runId, data.candidateId, data.parentId, data.ticket))
-    ipcMain.handle('mediaAcquisition:submitProviderShareImport', (_event, data: { runId: string; candidateId: string; parentId: string; ticket?: MediaAcquisitionTransferTicket | null }) => submitMediaAcquisitionProviderShareImport(data.runId, data.candidateId, data.parentId, data.ticket))
-    ipcMain.handle('mediaAcquisition:submitExternalUrl', (_event, data: { runId: string; parentId: string; url: string; fileName: string }) => submitMediaAcquisitionExternalUrl(data.runId, data.parentId, data.url, data.fileName))
-    ipcMain.handle('mediaAcquisition:getProviderTransferStatus', (_event, data: { runId: string; taskId?: string; fileId?: string }) => getMediaAcquisitionProviderTransferStatus(data.runId, data.taskId, data.fileId))
-    ipcMain.handle('mediaAcquisition:recordCandidateBaseline', (_event, runId: string, candidateId: string, files: MediaAcquisitionFileSnapshot[]) => recordMediaAcquisitionCandidateBaseline(runId, candidateId, files))
-    ipcMain.handle('mediaAcquisition:getCandidateBaseline', (_event, runId: string, candidateId: string) => getMediaAcquisitionCandidateBaseline(runId, candidateId))
-    ipcMain.handle('mediaAcquisition:markCandidateTransferring', (_event, runId: string, candidateId: string) => markMediaAcquisitionCandidateTransferring(runId, candidateId))
-    ipcMain.handle('mediaAcquisition:recordTransferIntent', (_event, runId: string, candidateId: string, activity: string) => recordMediaAcquisitionTransferIntent(runId, candidateId, activity))
-    ipcMain.handle('mediaAcquisition:selectCandidate', (_event, runId: string, candidateId: string, reason: string) => selectMediaAcquisitionCandidate(runId, candidateId, reason))
-    ipcMain.handle('mediaAcquisition:recordExternalTask', (_event, runId: string, candidateId: string, taskId?: string, fileId?: string, activity?: string) => recordMediaAcquisitionExternalTask(runId, candidateId, taskId, fileId, activity || '已提交网盘任务，等待完成'))
-    ipcMain.handle('mediaAcquisition:updateExternalTask', (_event, runId: string, candidateId: string, progress: number, activity: string) => updateMediaAcquisitionExternalTaskProgress(runId, candidateId, progress, activity))
-    ipcMain.handle('mediaAcquisition:retryCandidate', (_event, runId: string, candidateId: string, message: string, delayMs?: number) => retryMediaAcquisitionCandidate(runId, candidateId, message, delayMs))
-    ipcMain.handle('mediaAcquisition:noCoverage', (_event, runId: string, reason: string) => markMediaAcquisitionNoCoverage(runId, reason))
-    ipcMain.handle('mediaAcquisition:failRun', (_event, runId: string, message: string) => failMediaAcquisitionRun(runId, message))
-    ipcMain.handle('mediaAcquisition:beginCandidateVerification', (_event, runId: string, candidateId: string, activity: string) => beginMediaAcquisitionCandidateVerification(runId, candidateId, activity))
-    ipcMain.handle('mediaAcquisition:beginOrganizing', (_event, runId: string, activity?: string) => beginMediaAcquisitionOrganizing(runId, activity))
-    ipcMain.handle('mediaAcquisition:completeCandidate', (_event, runId: string, candidateId: string, message: string) => completeMediaAcquisitionCandidate(runId, candidateId, message))
-    ipcMain.handle('mediaAcquisition:completeRun', (_event, runId: string, message: string, data?: Record<string, unknown>) => completeMediaAcquisitionRun(runId, message, data))
-    ipcMain.handle('mediaAcquisition:partialCandidate', (_event, runId: string, candidateId: string, message: string) => partialMediaAcquisitionCandidate(runId, candidateId, message))
-    ipcMain.handle('mediaAcquisition:continueAfterPartial', (_event, runId: string, candidateId: string, seasonTargets: Array<{ seasonNumber: number; missingEpisodes: number[] }>, message: string) => continueMediaAcquisitionAfterPartial(runId, candidateId, seasonTargets, message))
-    ipcMain.handle('mediaAcquisition:failCandidate', (_event, runId: string, candidateId: string, message: string, continueWithAlternatives?: boolean) => failMediaAcquisitionCandidate(runId, candidateId, message, continueWithAlternatives))
-    ipcMain.handle('mediaAcquisition:addEvent', (_event, runId: string, level: MediaAcquisitionEvent['level'], phase: MediaAcquisitionPhase, message: string, data?: Record<string, unknown>) => addMediaAcquisitionEvent(runId, level, phase, message, data))
-    ipcMain.handle('mediaAcquisition:assrtSearch', (_event, data: { token?: string; query?: string }) => searchAssrtSubtitles(data?.token, data?.query))
-    ipcMain.handle('mediaAcquisition:assrtDetail', (_event, data: { token?: string; subtitleId?: number }) => getAssrtSubtitleFiles(data?.token, data?.subtitleId))
+    registerMediaryIpc()
     ipcMain.handle('workspaceAgent:create', (_event, input: CreateWorkspaceTaskInput) => createWorkspaceTask(input))
     ipcMain.handle('workspaceAgent:list', (_event, limit?: number, includeArchived?: boolean) => listWorkspaceTasks(limit, includeArchived))
     ipcMain.handle('workspaceAgent:get', (_event, taskId: string) => getWorkspaceTask(taskId))
@@ -320,8 +264,6 @@ export default class ipcEvent {
     ipcMain.handle('agentV1:aiSearch:finishAudit', (_event, sessionId: string, runId: string, status?: 'completed' | 'failed' | 'cancelled', message?: string) => finishAiSearchV1Audit(sessionId, runId, status, message))
     ipcMain.handle('agentV1:aiSearch:collectStorageStats', (_event, workflowId: string) => collectAiSearchStorageStats(workflowId))
     ipcMain.handle('agentV1:aiSearch:confirmWrite', (_event, input: import('../aiSearch/AiSearchV1Bridge').ConfirmAiSearchV1WriteInput) => confirmAiSearchV1Write(input))
-    ipcMain.handle('agentV1:media:beginTransfer', (_event, runId: string, candidateId: string, reason: string) => beginMediaAcquisitionV1Transfer(runId, candidateId, reason))
-    ipcMain.handle('agentV1:media:completeTransfer', (_event, ticket: MediaAcquisitionTransferTicket, success: boolean, message: string) => completeMediaAcquisitionV1Transfer(ticket, success, message))
     ipcMain.handle('agentV1:document:beginAudit', (_event, input: { sessionId: string; runId: string; goal: string; sources: DocumentAgentV1Source[] }) => beginDocumentV1Audit(input))
     ipcMain.handle('agentV1:document:recordCitation', (_event, workflowId: string, input: { sourceId: string; location: string }) => recordDocumentV1Citation(workflowId, input))
     ipcMain.handle('agentV1:document:finishAudit', (_event, workflowId: string, status: 'completed' | 'failed' | 'cancelled', message: string) => finishDocumentV1Audit(workflowId, status, message))
@@ -658,9 +600,9 @@ export default class ipcEvent {
         fr: 'pc'
       })
       const url = `https://drive.quark.cn/1/clouddrive/file/download?${params.toString()}`
-      const sessionCookieHeader = await getQuarkSessionCookieHeader()
+      const sessionCookieHeader = await getQuarkSessionCookieHeader('https://drive.quark.cn')
       const accountCookieHeader = String(data?.cookie || '')
-      const cookieHeader = mergeQuarkCookie(sessionCookieHeader, accountCookieHeader)
+      const cookieHeader = mergeQuarkCookieHeaders(sessionCookieHeader, accountCookieHeader)
 
       return await new Promise((resolve) => {
         const request = net.request({
@@ -692,8 +634,8 @@ export default class ipcEvent {
                 }
               }
             }
-            const latestSessionCookie = await getQuarkSessionCookieHeader()
-            resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode, body, cookie: mergeQuarkCookie(latestSessionCookie, accountCookieHeader) })
+            const latestSessionCookie = await getQuarkSessionCookieHeader('https://drive.quark.cn')
+            resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode, body, cookie: mergeQuarkCookieHeaders(latestSessionCookie, accountCookieHeader) })
           })
         })
         request.on('error', (error) => resolve({ ok: false, status: 0, body: '', cookies: [], error: error.message }))
@@ -712,9 +654,9 @@ export default class ipcEvent {
       })
       const url = `https://drive-pc.quark.cn/1/clouddrive/file/sort?${params.toString()}`
       const accountCookieHeader = String(data?.cookie || '')
-      const cookieHeader = mergeQuarkCookie(await getQuarkSessionCookieHeader(), accountCookieHeader)
+      const cookieHeader = mergeQuarkAccountCookies(accountCookieHeader, await getQuarkSessionCookieHeader('https://drive-pc.quark.cn'))
       return await new Promise((resolve) => {
-        const request = net.request({ method: 'GET', url, useSessionCookies: true } as any)
+        const request = net.request({ method: 'GET', url, useSessionCookies: false } as any)
         request.setHeader('Accept', 'application/json, text/plain, */*')
         request.setHeader('Accept-Language', 'zh-CN,zh;q=0.9')
         request.setHeader('Content-Type', 'application/json')
@@ -729,11 +671,11 @@ export default class ipcEvent {
             const setCookie = response.headers['set-cookie']
             const setCookieList = Array.isArray(setCookie) ? setCookie : (setCookie ? [String(setCookie)] : [])
             for (const rawCookie of setCookieList) {
-              const cookie = ipcEvent.parseSetCookie(rawCookie, 'https://drive.quark.cn')
+              const cookie = ipcEvent.parseSetCookie(rawCookie, 'https://drive-pc.quark.cn')
               if (cookie) await session.defaultSession.cookies.set(cookie).catch(() => undefined)
             }
-            const latestSessionCookie = await getQuarkSessionCookieHeader()
-            resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode, body: Buffer.concat(chunks).toString('utf8'), cookie: mergeQuarkCookie(latestSessionCookie, accountCookieHeader) })
+            const latestSessionCookie = await getQuarkSessionCookieHeader('https://drive-pc.quark.cn')
+            resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode, body: Buffer.concat(chunks).toString('utf8'), cookie: mergeQuarkCookieHeaders(latestSessionCookie, accountCookieHeader) })
           })
         })
         request.on('error', (error) => resolve({ ok: false, status: 0, body: '', error: error.message }))
@@ -1192,7 +1134,7 @@ export default class ipcEvent {
   private static handleExportCliTokens() {
     ipcMain.handle('ExportCliTokens', async (_event, data: { accounts: any[] }) => {
       try {
-        const cliDir = path.join(os.homedir(), '.clouddrive-cli')
+        const cliDir = resolveCloudDriveCliConfigDir(process.env.CLOUDDRIVE_CLI_CONFIG_DIR, os.homedir())
         const tokensPath = path.join(cliDir, 'tokens.json')
         const configPath = path.join(cliDir, 'config.json')
         mkdirSync(cliDir, { recursive: true })

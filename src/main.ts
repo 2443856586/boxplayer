@@ -1,5 +1,7 @@
+import { summarizeStartupFailures } from './utils/startupDiagnostics'
 import { createApp } from 'vue'
 import App from './App.vue'
+import './styles/mediaPosters.css'
 import ArcoVue from '@arco-design/web-vue'
 import store, { useAppStore, useSettingStore } from './store'
 import '@arco-themes/vue-gi-demo/css/arco.css'
@@ -8,9 +10,10 @@ import DebugLog from './utils/debuglog'
 import { PageMain } from './layout/PageMain'
 import { WorkerPage } from './workerpage/workercmd'
 import ServerHttp from './aliapi/server'
-import { startMediaAcquisitionWorkflowRunner, wakeMediaAcquisitionWorkflowRunner } from './services/mediaAcquisition/workflowRunner'
+import { startMediaryBridge } from './services/mediaAcquisition/mediaryBridge'
 import { setLocale } from './i18n'
 import UserDAL from './user/userdal'
+import DB from './utils/db'
 import { startAnalytics } from './analytics/posthog'
 import { restoreBoxPlayerAuth } from './utils/boxplayerAuth'
 
@@ -66,6 +69,14 @@ window.addEventListener('unhandledrejection', function (event) {
 })
 
 const app = createApp(App)
+if (window.WebIsE2E) {
+  window.WebE2EStartupDiagnostics = () => summarizeStartupFailures(DebugLog.logList)
+  window.WebE2ESeedCloudAccounts = async (accounts, defaultUserId) => {
+    await DB.saveUserBatch(accounts as any[])
+    await DB.saveValueString('uiDefaultUser', defaultUserId)
+    await UserDAL.ClearUserTokenMap()
+  }
+}
 import IconFont from './components/IconFont.vue'
 app.component('IconFont', IconFont)
 app.config.errorHandler = function (err: any, vm, info) {
@@ -89,13 +100,9 @@ settingStore.$subscribe((_mutation, state) => setLocale(state.uiLanguage))
 // network-failure tracking before those first requests begin.
 startAnalytics()
 app.mount('#app')
-window.Electron.ipcRenderer.on('mediaAcquisition:wake', () => {
-  // A deep-link page can receive the durable main-process wake before the UI
-  // switches back to PageMain. The runner is lease-protected, so start it in
-  // every renderer route rather than silently dropping queued work.
-  startMediaAcquisitionWorkflowRunner()
-  wakeMediaAcquisitionWorkflowRunner()
-})
+// Media acquisition runs in the main process; it asks this window for the AI model
+// setting and leaves the media-library scan of landed files to it.
+startMediaryBridge()
 
 
 window.WinMsgToMain = function (event: any) {
@@ -168,7 +175,6 @@ window.Electron.ipcRenderer.on('setPage', async (_event: any, args: any) => {
   if (args.page == 'PageMain') {
     PageMain()
     window.IsMainPage = true
-    startMediaAcquisitionWorkflowRunner()
   } else if (args.page == 'PageWorker') {
     WorkerPage(args.data.type)
   } else if (args.page == 'PageCode') {

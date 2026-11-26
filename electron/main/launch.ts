@@ -1,5 +1,5 @@
 import { AppWindow, createMainWindow, createTray } from './core/window'
-import { startMediaAcquisitionWakeScheduler } from './mediaAcquisition/MediaAcquisitionWakeScheduler'
+import { startMediaryHost, stopMediaryHost } from './mediary/MediaryHost'
 import { startAgentCliExecutionScheduler, stopAgentCliExecutionScheduler } from './agent/AgentCliExecutionScheduler'
 import { app, ipcMain, protocol, session } from 'electron'
 import { registerAutoUpdate } from './core/autoUpdate'
@@ -19,8 +19,10 @@ import { destroyDb } from './reedy/ReedyService'
 import { DRIVE115_DOWN_AGENT } from '@shared/drive115'
 import { restoreCloud189DateHeader } from '@shared/cloud189RequestHeaders'
 import { Drive115PlaybackAuthRegistry } from './drive115PlaybackAuth'
+import { embeddedMpvBridge } from './mpv/embeddedMpvBridge'
+import { handleTraktCallback } from './trakt'
 
-const OAUTH_PROTOCOLS = ['xbyboxplayer-oauth', 'boxplayer-onedriveoauth', 'boxplayer-auth']
+const OAUTH_PROTOCOLS = ['xbyboxplayer-oauth', 'boxplayer-onedriveoauth', 'boxplayer-auth', 'boxplayer-traktoauth']
 
 type UserToken = {
   access_token: string;
@@ -296,7 +298,7 @@ export default class launch extends EventEmitter {
         createMainWindow()
         registerExternalFileProtocol(() => AppWindow.mainWindow)
         if (process.env.BOXPLAYER_E2E !== '1') {
-          startMediaAcquisitionWakeScheduler()
+          startMediaryHost()
           startAgentCliExecutionScheduler()
           createTray()
           registerAutoUpdate()
@@ -359,7 +361,9 @@ export default class launch extends EventEmitter {
 
   handleAppWillQuit() {
     app.on('will-quit', async () => {
+      embeddedMpvBridge.destroy?.()
       stopAgentCliExecutionScheduler()
+      try { stopMediaryHost() } catch {}
       this.stopGoogleOAuthLoopback()
       try { await this.motrixApp?.quit() } catch {}
       try { destroyDb() } catch {}
@@ -450,6 +454,11 @@ export default class launch extends EventEmitter {
 
   private dispatchOAuthUrl(url: string) {
     if (!url) return
+    if (handleTraktCallback(url)) {
+      const win = AppWindow.mainWindow
+      if (win && !win.isDestroyed()) { if (win.isMinimized()) win.restore(); win.show(); win.focus() }
+      return
+    }
     if (AppWindow.mainWindow && AppWindow.mainWindow.isDestroyed() === false) {
       if (url.startsWith('boxplayer-auth://payment-')) {
         try {

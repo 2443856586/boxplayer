@@ -65,8 +65,8 @@
         >
           <Clock3 class="nav-icon" />
           <span>{{ t('media.recentlyAdded') }}</span>
-          <span v-if="mediaStore.recentlyAdded.length > 0" class="count">
-            {{ mediaStore.recentlyAdded.length }}
+          <span v-if="mediaStore.mediaItemCount > 0" class="count">
+            {{ mediaStore.mediaItemCount }}
           </span>
         </div>
 
@@ -216,27 +216,39 @@
     </div>
 
     <!-- 媒体库文件夹列表 -->
-    <div class="nav-section" v-if="visibleVideoFolders.length > 0">
+    <div class="nav-section" v-if="visibleVideoFolders.length > 0 || localDeviceFolders.length > 0">
       <div class="nav-header">
         <Folder class="nav-header-icon" />
         <span>{{ t('media.fileSources') }}</span>
       </div>
 
       <div class="nav-items">
-        <div
-          v-for="folder in visibleVideoFolders"
-          :key="folder.id"
-          class="nav-item folder-item"
+        <template v-if="localDeviceFolders.length">
+          <button class="nav-item folder-item local-device-root" type="button"
+            :aria-expanded="localDeviceExpanded" @click="localDeviceExpanded = !localDeviceExpanded">
+            <Folder class="nav-icon" />
+            <span class="folder-name">{{ localDeviceName }}</span>
+            <span aria-hidden="true"><ChevronDown v-if="localDeviceExpanded" :size="14" /><ChevronRight v-else :size="14" /></span>
+          </button>
+          <div v-if="localDeviceExpanded" class="local-device-folders">
+            <div v-for="folder in localDeviceFolders" :key="folder.id"
+              class="nav-item folder-item" :class="{ active: selectedFolder?.id === folder.id }"
+              @click="openLocalFolder(folder)" @contextmenu="handleFolderRightClick($event, folder)">
+              <Folder class="nav-icon" />
+              <span class="folder-name">{{ folder.name }}</span>
+              <button type="button" :aria-label="t(folder.isFavorite === false ? 'unified.addToFavorites' : 'unified.removeFavoriteFolder')" @click.stop="toggleLocalFavorite(folder)">
+                <Star :size="16" :fill="folder.isFavorite === false ? 'none' : 'currentColor'" />
+              </button>
+            </div>
+          </div>
+        </template>
+        <div v-for="folder in remoteSourceFolders" :key="folder.id" class="nav-item folder-item"
           :class="{ active: selectedFolder?.id === folder.id }"
-          @click="handleFolderClick(folder)"
-          @contextmenu="handleFolderRightClick($event, folder)"
-        >
+          @click="handleFolderClick(folder)" @contextmenu="handleFolderRightClick($event, folder)">
           <Folder class="nav-icon" />
           <div class="folder-main">
             <span class="folder-name">{{ folder.name }}</span>
-            <span class="folder-source" :class="getFolderSourceClass(folder)">
-              {{ getFolderSourceLabel(folder) }}
-            </span>
+            <span class="folder-source" :class="getFolderSourceClass(folder)">{{ getFolderSourceLabel(folder) }}</span>
           </div>
         </div>
       </div>
@@ -286,6 +298,27 @@
       </template>
     </a-dropdown>
 
+    <a-modal v-model:visible="showLocalBrowser" :title="localBrowserTitle" :footer="false">
+      <button v-if="localBrowserPath" type="button" @click="localBrowserBack">{{ t('unified.back') }}</button>
+      <template v-if="!localBrowserPath">
+        <div v-for="folder in localDeviceFolders" :key="folder.id" class="local-browser-row">
+          <button type="button" @click="openLocalFolder(folder)"><FolderClosed class="local-browser-icon" :size="34" /> {{ folder.name }}</button>
+          <button class="local-browser-star" type="button" @click="toggleLocalFavorite(folder)" :aria-label="t(folder.isFavorite === false ? 'unified.addToFavorites' : 'unified.removeFavoriteFolder')">
+            <Star :size="18" :fill="folder.isFavorite === false ? 'none' : 'currentColor'" />
+          </button>
+        </div>
+      </template>
+      <div v-for="entry in localBrowserEntries" v-else :key="entry.path" class="local-browser-row">
+        <button type="button" @click="openLocalEntry(entry)">
+          <FolderClosed v-if="entry.directory" class="local-browser-icon" :size="34" />
+          <span v-else class="local-browser-video" aria-hidden="true"><Play :size="12" fill="currentColor" /></span>
+          {{ entry.name }}
+        </button>
+      </div>
+    </a-modal>
+    <a-modal v-model:visible="showLocalNameModal" :title="t('libraryBrowse.addHome')" :ok-text="t('common.add')" :cancel-text="t('common.cancel')" @before-ok="confirmLocalFolderName">
+      <a-input v-model="localFolderName" />
+    </a-modal>
     <a-modal
       v-model:visible="showLibraryManagerModal"
       :title="t('media.manager')"
@@ -310,7 +343,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { CalendarDays, CircleHelp, CirclePlay, Clock3, EyeOff, Film, Folder, Heart, House, ListVideo, Search, Shapes, Star, Tags, Tv, Video } from 'lucide-vue-next'
+import { ChevronDown, ChevronRight, CalendarDays, CircleHelp, CirclePlay, Clock3, EyeOff, Film, Folder, FolderClosed, Heart, House, ListVideo, Play, Search, Shapes, Star, Tags, Tv, Video } from 'lucide-vue-next'
 import { useMediaLibraryStore } from '../store/medialibrary'
 import type { MediaLibraryFolder } from '../types/media'
 import type { IAliGetFileModel } from '../aliapi/alimodels'
@@ -321,7 +354,9 @@ import LibraryScanPanel from './LibraryScanPanel.vue'
 import { getWebDavConnection, getWebDavConnectionId, getWebDavConnections } from '../utils/webdavClient'
 import UserDAL from '../user/userdal'
 import type { ITokenInfo } from '../user/userstore'
+import { tokenRootScanFolders } from '../utils/fileSourceRoots'
 import { t } from '../i18n'
+import { buildLocalVideoPage, isLocalVideoPath } from '../down/integration/localVideoPlayback'
 
 const mediaStore = useMediaLibraryStore()
 const mediaScanner = MediaScanner.getInstance()
@@ -332,6 +367,44 @@ const visibleVideoFolders = computed(() => {
 })
 
 // 状态
+const isLocalDeviceFolder = (folder: MediaLibraryFolder) =>
+  folder.driveId === 'local' || folder.driveServerId === 'local' || folder.userId === 'local'
+const localDeviceFolders = computed(() => mediaStore.folders.filter(isLocalDeviceFolder))
+const remoteSourceFolders = computed(() => visibleVideoFolders.value.filter(folder => !isLocalDeviceFolder(folder)))
+const localDeviceExpanded = ref(true)
+const localDeviceName = /mac/i.test(navigator.platform) ? 'Mac' : t('unified.myComputer')
+const showLocalBrowser = ref(false)
+const localBrowserPath = ref('')
+const localBrowserRoot = ref('')
+const localBrowserName = ref('')
+const localBrowserEntries = ref<{ name: string; path: string; directory: boolean }[]>([])
+const localBrowserTitle = computed(() => localBrowserPath.value ? localBrowserName.value : localDeviceName)
+const showLocalDevice = () => { localBrowserPath.value = ''; localBrowserEntries.value = []; showLocalBrowser.value = true }
+const loadLocalDirectory = async (directory: string) => {
+  const fs = window.require?.('fs'); const path = window.require?.('path')
+  if (!fs || !path) return
+  try {
+    const entries = await fs.promises.readdir(directory, { withFileTypes: true })
+    localBrowserEntries.value = entries.filter((entry: { name: string; isDirectory: () => boolean }) => !entry.name.startsWith('.') && (entry.isDirectory() || isLocalVideoPath(entry.name)))
+      .map((entry: { name: string; isDirectory: () => boolean }) => ({ name: entry.name, path: path.join(directory, entry.name), directory: entry.isDirectory() }))
+      .sort((a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+    localBrowserPath.value = directory
+    localBrowserName.value = directory === localBrowserRoot.value ? localBrowserName.value : path.basename(directory)
+  } catch { message.error(t('media.importFailed')) }
+}
+const openLocalFolder = (folder: MediaLibraryFolder) => {
+  localBrowserRoot.value = folder.path || folder.fileId; localBrowserName.value = folder.name; showLocalBrowser.value = true
+  void loadLocalDirectory(localBrowserRoot.value)
+}
+const openLocalEntry = (entry: { path: string; directory: boolean }) => {
+  if (entry.directory) void loadLocalDirectory(entry.path)
+  else window.WebOpenWindow({ page: 'PageVideo', data: buildLocalVideoPage(entry.path), theme: 'dark' })
+}
+const localBrowserBack = () => {
+  if (localBrowserPath.value === localBrowserRoot.value) { showLocalDevice(); return }
+  const path = window.require?.('path'); if (path) void loadLocalDirectory(path.dirname(localBrowserPath.value))
+}
+
 const activeCategory = ref('home')
 const selectedFolder = ref<MediaLibraryFolder | null>(null)
 const selectedGenre = ref('')
@@ -534,91 +607,6 @@ watch(scanSourceOptions, (options) => {
   selectedScanSourceIds.value = current.length || !options.length ? current : options.map((option) => option.value)
 }, { immediate: true })
 
-function driveLabelFromToken(token: ITokenInfo): string {
-  if (token.tokenfrom === 'cloud123') return t('drive.cloud123')
-  if (token.tokenfrom === '115') return t('drive.drive115')
-  if (token.tokenfrom === 'baidu') return t('drive.baiduFull')
-  if (token.tokenfrom === 'pikpak') return 'PikPak'
-  if (token.tokenfrom === 'quark') return t('drive.quarkFull')
-  if (token.tokenfrom === '139') return t('drive.cloud139')
-  if (token.tokenfrom === '189') return t('drive.cloud189')
-  if (token.tokenfrom === 'guangya') return t('drive.guangya')
-  if (token.tokenfrom === 'dropbox') return 'Dropbox'
-  if (token.tokenfrom === 'onedrive') return 'OneDrive'
-  if (token.tokenfrom === 'box') return 'Box'
-  return t('drive.aliyun')
-}
-
-function scanAccountLabel(token: ITokenInfo): string {
-  return `${driveLabelFromToken(token)} · ${token.nick_name || token.user_name || token.name || token.user_id}`
-}
-
-function makeScanFolder(token: ITokenInfo, driveId: string, fileId: string, name: string, path = ''): IAliGetFileModel {
-  const folder = {
-    __v_skip: true,
-    drive_id: driveId,
-    file_id: fileId,
-    parent_file_id: '',
-    name,
-    namesearch: name.toLowerCase(),
-    path,
-    ext: '',
-    mime_type: '',
-    mime_extension: '',
-    category: 'folder',
-    icon: '',
-    size: 0,
-    sizeStr: '',
-    time: Date.now(),
-    timeStr: '',
-    starred: false,
-    isDir: true,
-    thumbnail: '',
-    description: ''
-  } as IAliGetFileModel
-  ;(folder as any).user_id = token.user_id
-  return folder
-}
-
-function tokenRootScanFolders(token: ITokenInfo): ScanSourceTarget[] {
-  if (!token?.user_id || !token?.access_token) return []
-  const label = scanAccountLabel(token)
-  if (token.tokenfrom === 'aliyun') {
-    const drives = [
-      { driveId: token.default_drive_id, name: t('drive.default') },
-      { driveId: token.resource_drive_id, name: t('drive.resource') },
-      { driveId: token.backup_drive_id, name: t('drive.backup') }
-    ].filter((item): item is { driveId: string; name: string } => !!item.driveId)
-    return drives.map((item) => ({
-      value: `account:${token.user_id}:${item.driveId}:root`,
-      label: `${label} · ${item.name}`,
-      folder: makeScanFolder(token, item.driveId, 'root', item.name),
-      driveServerId: item.driveId
-    }))
-  }
-
-  const nonAliRoot: Record<string, { driveId: string; fileId: string; path?: string }> = {
-    cloud123: { driveId: 'cloud123', fileId: '0' },
-    '115': { driveId: 'drive115', fileId: '0' },
-    baidu: { driveId: 'baidu', fileId: '/', path: '/' },
-    pikpak: { driveId: 'pikpak', fileId: 'pikpak_root' },
-    quark: { driveId: 'quark', fileId: '0' },
-    '139': { driveId: 'cloud139', fileId: 'cloud139_root' },
-    '189': { driveId: 'cloud189', fileId: 'cloud189_root' },
-    guangya: { driveId: 'guangya', fileId: 'guangya_root' },
-    dropbox: { driveId: 'dropbox', fileId: 'dropbox_root' },
-    onedrive: { driveId: 'onedrive', fileId: 'onedrive_root' },
-    box: { driveId: 'box', fileId: '0' }
-  }
-  const root = nonAliRoot[token.tokenfrom]
-  if (!root) return []
-  return [{
-    value: `account:${token.user_id}:${root.driveId}:${root.fileId}`,
-    label,
-    folder: makeScanFolder(token, root.driveId, root.fileId, '/', root.path || ''),
-    driveServerId: root.driveId
-  }]
-}
 
 function mediaFolderToAliModel(folder: MediaLibraryFolder): IAliGetFileModel {
   const model = {
@@ -676,17 +664,6 @@ const handleDeleteFolder = () => {
     okButtonProps: { status: 'danger' },
     cancelText: t('common.cancel'),
     onOk: () => {
-      if (isWebDavFolderSource(folder)) {
-        const connectionId = folder.userId || getWebDavConnectionId(folder.driveId)
-        if (connectionId) {
-          const relatedFolders = mediaStore.folders.filter(item =>
-            isWebDavFolderSource(item)
-            && ((item.userId && item.userId === connectionId) || item.driveId === `webdav:${connectionId}`)
-          )
-          relatedFolders.forEach(item => mediaStore.removeFolder(item.id))
-        }
-      }
-
       // 从媒体库删除文件夹和相关媒体
       mediaStore.removeFolder(folder.id)
       console.log(`已删除文件夹: ${folder.name}`)
@@ -718,6 +695,40 @@ const selectRating = (rating: string) => {
   emit('ratingSelected', selectedRating.value)
 }
 
+const showLocalNameModal = ref(false)
+const localFolderName = ref('')
+const pendingLocalFolderPath = ref('')
+const pendingLocalFavoriteId = ref('')
+const toggleLocalFavorite = (folder: MediaLibraryFolder) => {
+  if (folder.isFavorite === false) {
+    pendingLocalFavoriteId.value = folder.id
+    pendingLocalFolderPath.value = folder.path || folder.fileId
+    localFolderName.value = folder.name
+    showLocalNameModal.value = true
+    return
+  }
+  Modal.confirm({
+    title: t('unified.removeFavoriteFolder'), content: folder.name,
+    okText: t('unified.removeFavoriteFolder'), cancelText: t('common.cancel'),
+    onOk: () => {
+      const current = mediaStore.folders.find(item => item.id === folder.id)
+      if (current) mediaStore.addFolder({ ...current, isFavorite: false })
+    }
+  })
+}
+const confirmLocalFolderName = async () => {
+  const name = localFolderName.value.trim()
+  if (!name || !pendingLocalFolderPath.value) return false
+  const path = pendingLocalFolderPath.value
+  const existing = pendingLocalFavoriteId.value && mediaStore.folders.find(folder => folder.id === pendingLocalFavoriteId.value)
+  if (pendingLocalFavoriteId.value && !existing) return false
+  if (existing) mediaStore.addFolder({ ...existing, name, isFavorite: true })
+  pendingLocalFolderPath.value = ''
+  pendingLocalFavoriteId.value = ''
+  await mediaScanner.scanLocalFolder(path, name)
+  return true
+}
+
 const handleImportLocalFolder = () => {
   if (mediaStore.isScanning) return
   if (window.WebShowOpenDialogSync) {
@@ -730,12 +741,10 @@ const handleImportLocalFolder = () => {
       async (result: string[] | undefined) => {
         if (!result || !result[0]) return
         const folderPath = result[0]
-        try {
-          await mediaScanner.scanLocalFolder(folderPath)
-        } catch (error) {
-          console.error('导入本地文件夹失败:', error)
-          message.error(t('media.importFailed'))
-        }
+        pendingLocalFavoriteId.value = ''
+        pendingLocalFolderPath.value = folderPath
+        localFolderName.value = folderPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || folderPath
+        showLocalNameModal.value = true
       }
     )
   } else {
@@ -819,7 +828,13 @@ const emit = defineEmits([
 
 // 暴露给父组件的方法
 defineExpose({
+  showLocalDevice,
   showAddFolderDialog,
+  importLocalFolder: handleImportLocalFolder,
+  removeFolder: (folder: MediaLibraryFolder) => {
+    contextMenuFolder.value = folder
+    handleDeleteFolder()
+  },
   openLibraryManager,
   syncActiveCategory,
   syncSelectedFolder
@@ -1395,4 +1410,16 @@ onUnmounted(() => {
   background-color: var(--color-danger-light-1);
   color: var(--color-danger-6);
 }
+</style>
+
+<style scoped>
+.local-device-root { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; font: inherit; }
+.local-device-root .folder-name { flex: 1; }
+.local-device-folders { padding-left: 22px; }
+.local-device-folders button, .local-browser-row button { border: 0; background: transparent; color: var(--color-text-1); cursor: pointer; }
+.local-device-folders button:last-child, .local-browser-star { color: #ff8a00 !important; }
+.local-browser-row { display: flex; align-items: center; gap: 12px; min-height: 60px; padding: 0 20px; background: var(--color-fill-2); border-bottom: 1px solid var(--color-border-2); }
+.local-browser-row button:first-child { display: flex; align-items: center; gap: 20px; flex: 1; min-width: 0; text-align: left; font-size: 18px; }
+.local-browser-icon, .local-browser-video { flex: 0 0 34px; color: #ff8a00; }
+.local-browser-video { display: grid; place-items: center; width: 30px; height: 24px; box-sizing: border-box; border: 2px solid currentColor; border-radius: 3px; }
 </style>

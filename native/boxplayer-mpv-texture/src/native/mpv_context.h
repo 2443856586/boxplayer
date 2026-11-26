@@ -15,6 +15,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <unordered_map>
+#include <chrono>
 
 #include "texture_share.h"
 
@@ -23,8 +25,13 @@ namespace mpv_texture {
 // Status information for the renderer
 struct MpvStatus {
     bool playing;
+    bool loading = false;
+    bool buffering = false;
+    bool ended = false;
     double volume;
+    double speed = 1.0;
     bool muted;
+    double bufferedPosition = 0;
     double position;
     double duration;
     int width;
@@ -44,6 +51,8 @@ struct MpvTrack {
 struct MpvTrackStatus {
     int audioId = -1;
     int subtitleId = -1;
+    int secondarySubtitleId = -1;
+    int secondarySubtitleLines = 0;
     std::vector<MpvTrack> tracks;
 };
 
@@ -59,13 +68,16 @@ struct MpvSubtitleStyle {
 using FrameCallback = std::function<void(const TextureInfo&)>;
 using StatusCallback = std::function<void(const MpvStatus&)>;
 using ErrorCallback = std::function<void(const std::string&)>;
+using CommandCallback = std::function<void(int)>;
 
 // Configuration for creating the context
 struct MpvConfig {
     uint32_t width = 1920;
     uint32_t height = 1080;
     std::string hwdec = "auto";  // Hardware decoding: auto, d3d11va, videotoolbox, etc.
+    std::string fontsDir;      // Real filesystem directory containing bundled CJK fonts
     std::string vo = "libmpv";   // Video output
+    bool headless = false;        // Control-only mode; no GL context or shared texture
 };
 
 class MpvContext {
@@ -85,13 +97,15 @@ public:
     void stop();
     void seek(double position);
     void setVolume(double volume);
+    void setSpeed(double speed);
     void setAudioTrack(int id);
     void setSubtitleTrack(int id);
     void setSubtitleStyle(const MpvSubtitleStyle& style);
     void setVideoProperty(const std::string& name, const std::string& value);
-    bool addAudio(const std::string& url, const std::string& title = "");
-    bool addSubtitle(const std::string& url, const std::string& title = "");
+    void addAudio(const std::string& url, const std::string& title, CommandCallback completion);
+    void addSubtitle(const std::string& url, const std::string& title, CommandCallback completion);
     void toggleMute();
+    void useSoftwareReadback() { m_forceReadback = true; }
 
     // Callbacks
     void setFrameCallback(FrameCallback callback);
@@ -110,9 +124,20 @@ private:
     void eventLoop();
     void handleEvent(mpv_event* event);
     void handlePropertyChange(mpv_event_property* prop);
+    void submitTrackCommand(const char** command, CommandCallback completion);
+    void completeTrackCommand(uint64_t id, int error);
+    void cancelTrackCommands();
+    void expireTrackCommands();
+    void cacheTracks(const mpv_node& tracks);
+    void setProperty(const char* name, const std::string& value);
 
     // Render thread
     void renderLoop();
+    void renderSoftwareLoop();
+    bool initializeRenderer();
+    void destroyRenderer();
+    bool m_softwareRenderer = false;
+    std::atomic<bool> m_forceReadback{false};
     void onRenderUpdate();
 
     // Static callback for mpv
@@ -137,6 +162,14 @@ private:
     std::mutex m_renderMutex;
     std::condition_variable m_renderCV;
     std::atomic<bool> m_needsRender{false};
+
+    // Render thread never waits for client API calls (libmpv render contract).
+    std::mutex m_commandMutex;
+    uint64_t m_nextCommandId = 0;
+    std::unordered_map<uint64_t, CommandCallback> m_trackCommands;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_commandDeadlines;
+    MpvTrackStatus m_tracks;
+    mutable std::mutex m_tracksMutex;
 
     // Texture resize synchronization (resize must happen on render thread)
     std::atomic<bool> m_needsResize{false};
